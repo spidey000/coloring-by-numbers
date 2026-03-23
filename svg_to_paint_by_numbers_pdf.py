@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+import functools
 import math
 import re
 import sys
 import time
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
@@ -166,6 +167,44 @@ class MysteryPatternData:
 
     cells: List[Polygon]
     boundary_lines: Optional[object]
+
+
+@dataclass
+class MysterySplitStats:
+    """Diagnostics for mystery-pattern fragmentation."""
+
+    zones_before: int = 0
+    split_attempts: int = 0
+    bbox_skips: int = 0
+    fragments_generated: int = 0
+    fragments_kept: int = 0
+    rejected_small: int = 0
+    rejected_ratio: int = 0
+    zones_unsplit_too_few: int = 0
+    zones_unsplit_over_limit: int = 0
+    zones_split: int = 0
+    zones_after: int = 0
+
+
+@dataclass
+class StageDiagnostics:
+    """Accumulates per-stage timing data for a conversion."""
+
+    timings: List[Tuple[str, float]] = field(default_factory=list)
+
+    def record(self, stage_name: str, elapsed: float) -> None:
+        self.timings.append((stage_name, elapsed))
+
+
+def log_stage_timing(
+    stage_name: str,
+    elapsed: float,
+    args: Optional[argparse.Namespace] = None,
+    **metrics: object,
+) -> None:
+    details = [f"{key}: {value}" for key, value in metrics.items() if value is not None]
+    suffix = f" | {' | '.join(details)}" if details else ""
+    log_step(f"Etapa {stage_name}: {format_elapsed(elapsed)}{suffix}", args)
 
 
 def local_name(tag: str) -> str:
@@ -646,6 +685,20 @@ def path_to_stroke_polygons(path: SvgPath, stroke_width: float, max_step: float,
     return polygons
 
 
+def bounds_overlap(
+    bounds_a: Tuple[float, float, float, float],
+    bounds_b: Tuple[float, float, float, float],
+) -> bool:
+    min_ax, min_ay, max_ax, max_ay = bounds_a
+    min_bx, min_by, max_bx, max_by = bounds_b
+    return not (
+        max_ax < min_bx
+        or max_bx < min_ax
+        or max_ay < min_by
+        or max_by < min_ay
+    )
+
+
 def parse_view_box(root: ET.Element) -> Optional[Tuple[float, float, float, float]]:
     raw = root.get("viewBox")
     if not raw:
@@ -866,6 +919,7 @@ def split_zone_by_pattern(
     min_fragment_area: float,
     min_fragment_ratio: float,
     max_fragments_per_zone: int,
+    stats: Optional[MysterySplitStats] = None,
 ) -> List[ColorZone]:
     try:
         fragments = split(zone.geometry, pattern_lines)
@@ -874,20 +928,37 @@ def split_zone_by_pattern(
 
     zone_area = max(zone.geometry.area, 1e-9)
     kept: List[ColorZone] = []
-    for fragment in getattr(fragments, "geoms", [fragments]):
+    raw_fragments = list(getattr(fragments, "geoms", [fragments]))
+    if stats is not None:
+        stats.fragments_generated += len(raw_fragments)
+
+    for fragment in raw_fragments:
         for poly in iter_polygons(safe_make_valid(fragment)):
             if poly.area <= 0:
                 continue
             if poly.area < min_fragment_area:
+                if stats is not None:
+                    stats.rejected_small += 1
                 continue
             if (poly.area / zone_area) < min_fragment_ratio:
+                if stats is not None:
+                    stats.rejected_ratio += 1
                 continue
             kept.append(ColorZone(color_hex=zone.color_hex, geometry=poly))
 
+    if stats is not None:
+        stats.fragments_kept += len(kept)
+
     if len(kept) < 2:
+        if stats is not None:
+            stats.zones_unsplit_too_few += 1
         return [zone]
     if max_fragments_per_zone > 0 and len(kept) > max_fragments_per_zone:
+        if stats is not None:
+            stats.zones_unsplit_over_limit += 1
         return [zone]
+    if stats is not None:
+        stats.zones_split += 1
     return kept
 
 
@@ -897,30 +968,43 @@ def apply_mystery_pattern(
     min_fragment_area: float,
     min_fragment_ratio: float,
     max_fragments_per_zone: int,
-) -> Tuple[List[ColorZone], Optional[object]]:
+) -> Tuple[List[ColorZone], Optional[object], MysterySplitStats]:
     pattern_lines = pattern_data.boundary_lines
+    stats = MysterySplitStats(zones_before=len(zones))
     if pattern_lines is None or getattr(pattern_lines, "is_empty", False):
-        return list(zones), None
+        stats.zones_after = len(zones)
+        return list(zones), None, stats
 
     split_zones: List[ColorZone] = []
     union_geometries = []
+    pattern_bounds = pattern_lines.bounds
     for zone in zones:
+        if not bounds_overlap(zone.geometry.bounds, pattern_bounds):
+            stats.bbox_skips += 1
+            split_zones.append(zone)
+            union_geometries.append(zone.geometry)
+            continue
+
+        stats.split_attempts += 1
         parts = split_zone_by_pattern(
             zone=zone,
             pattern_lines=pattern_lines,
             min_fragment_area=min_fragment_area,
             min_fragment_ratio=min_fragment_ratio,
             max_fragments_per_zone=max_fragments_per_zone,
+            stats=stats,
         )
         split_zones.extend(parts)
         union_geometries.extend([part.geometry for part in parts])
 
     if not union_geometries:
-        return list(zones), None
+        stats.zones_after = len(zones)
+        return list(zones), None, stats
 
     drawing_union = unary_union(union_geometries)
     clipped_boundaries = safe_make_valid(pattern_lines.intersection(drawing_union))
-    return split_zones, clipped_boundaries
+    stats.zones_after = len(split_zones)
+    return split_zones, clipped_boundaries, stats
 
 
 def build_layout(
@@ -1138,6 +1222,7 @@ def candidate_points_for_polygon(polygon: Polygon) -> List[Point]:
     return points
 
 
+@functools.lru_cache(maxsize=128)
 def label_pdf_metrics(label: str, font_size: float) -> Tuple[float, float, float]:
     text_width = pdfmetrics.stringWidth(label, FONT_NAME, font_size)
     ascent, descent = pdfmetrics.getAscentDescent(FONT_NAME, font_size)
@@ -1169,6 +1254,7 @@ def label_box_in_svg(
 
 def label_fits_inside_polygon(
     polygon: Polygon,
+    target_geometry,
     point: Point,
     text_width_pdf: float,
     ascent_pdf: float,
@@ -1186,10 +1272,6 @@ def label_fits_inside_polygon(
         scale=scale,
         padding_pdf=LABEL_PADDING_PDF,
     )
-
-    containment_margin_svg = max(0.15 / max(scale, 1e-9), 1e-6)
-    inner_polygon = safe_make_valid(polygon.buffer(-containment_margin_svg))
-    target_geometry = inner_polygon if not inner_polygon.is_empty else polygon
     return bool(target_geometry.contains(label_rect))
 
 
@@ -1285,6 +1367,9 @@ def label_placement(
     size = max_size
     step = 0.5
     base_candidates = candidate_points_for_polygon(base_poly)
+    containment_margin_svg = max(0.15 / max(scale, 1e-9), 1e-6)
+    inner_polygon = safe_make_valid(base_poly.buffer(-containment_margin_svg))
+    placement_geometry = inner_polygon if not inner_polygon.is_empty else base_poly
 
     while size >= min_size - 1e-9:
         text_width_pdf, ascent_pdf, descent_pdf = label_pdf_metrics(label, size)
@@ -1292,6 +1377,7 @@ def label_placement(
         for point in base_candidates:
             if label_fits_inside_polygon(
                 polygon=base_poly,
+                target_geometry=placement_geometry,
                 point=point,
                 text_width_pdf=text_width_pdf,
                 ascent_pdf=ascent_pdf,
@@ -1335,6 +1421,7 @@ def label_placement(
                         continue
                     if label_fits_inside_polygon(
                         polygon=base_poly,
+                        target_geometry=placement_geometry,
                         point=point,
                         text_width_pdf=text_width_pdf,
                         ascent_pdf=ascent_pdf,
@@ -1554,6 +1641,7 @@ def render_pdf(
     mystery_boundaries=None,
     mystery_boundary_gray: float = DEFAULT_MYSTERY_BOUNDARY_GRAY,
     mystery_boundary_width: float = DEFAULT_MYSTERY_BOUNDARY_WIDTH,
+    args: Optional[argparse.Namespace] = None,
 ) -> Tuple[int, int]:
     page_width, page_height = A4
     legend_height = compute_legend_height(len(palette))
@@ -1565,6 +1653,7 @@ def render_pdf(
     pdf.setFillColor(colors.white)
     pdf.rect(0, 0, page_width, page_height, stroke=0, fill=1)
 
+    stage_started_at = time.perf_counter()
     for shape in shapes:
         draw_black_outline(
             pdf,
@@ -1573,7 +1662,9 @@ def render_pdf(
             line_width=line_width,
             outline_gray=outline_gray,
         )
+    log_stage_timing("render-outline", time.perf_counter() - stage_started_at, args, shapes=len(shapes))
 
+    stage_started_at = time.perf_counter()
     draw_line_geometry(
         pdf,
         geometry=mystery_boundaries,
@@ -1581,7 +1672,9 @@ def render_pdf(
         line_width=mystery_boundary_width,
         stroke_gray=mystery_boundary_gray,
     )
+    log_stage_timing("render-mystery-boundaries", time.perf_counter() - stage_started_at, args)
 
+    stage_started_at = time.perf_counter()
     placed, skipped = draw_labels(
         pdf,
         zones=zones,
@@ -1591,7 +1684,16 @@ def render_pdf(
         max_font_size=max_font_size,
         number_gray=number_gray,
     )
+    log_stage_timing(
+        "render-labels",
+        time.perf_counter() - stage_started_at,
+        args,
+        zones=len(zones),
+        labels_placed=placed,
+        labels_skipped=skipped,
+    )
 
+    stage_started_at = time.perf_counter()
     draw_legend(
         pdf,
         palette=palette,
@@ -1600,45 +1702,92 @@ def render_pdf(
         legend_height=legend_height,
         show_hex=show_hex,
     )
+    log_stage_timing("render-legend", time.perf_counter() - stage_started_at, args, colors=len(palette))
 
+    stage_started_at = time.perf_counter()
     pdf.showPage()
     pdf.save()
+    log_stage_timing("render-save", time.perf_counter() - stage_started_at, args)
     return placed, skipped
 
 
 def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple[int, int, int]:
+    diagnostics = StageDiagnostics()
+
     log_step(f"Leyendo SVG base: {svg_path.name}", args)
+    stage_started_at = time.perf_counter()
     shapes, view_box = read_svg(svg_path)
+    elapsed = time.perf_counter() - stage_started_at
+    diagnostics.record("read-svg", elapsed)
+    log_stage_timing("read-svg", elapsed, args, shapes=len(shapes))
     mystery_boundaries = None
 
     log_step("Extrayendo zonas coloreables", args)
+    stage_started_at = time.perf_counter()
     zones = build_zones(
         shapes,
         include_strokes=args.include_strokes,
         max_step=args.max_segment_step,
         min_area=args.min_area,
     )
+    elapsed = time.perf_counter() - stage_started_at
+    diagnostics.record("build-zones", elapsed)
+    log_stage_timing("build-zones", elapsed, args, zones=len(zones), max_step=args.max_segment_step)
     log_step(f"Zonas iniciales detectadas: {len(zones)}", args)
 
     log_step("Normalizando color mas cercano al negro puro", args)
+    stage_started_at = time.perf_counter()
     zones = normalize_nearest_black(zones)
+    elapsed = time.perf_counter() - stage_started_at
+    diagnostics.record("normalize-black", elapsed)
+    log_stage_timing("normalize-black", elapsed, args, zones=len(zones))
 
     if args.mystery_pattern:
+        mystery_max_step = args.mystery_max_segment_step
         log_step(f"Cargando patron mystery: {Path(args.mystery_pattern).name}", args)
+        stage_started_at = time.perf_counter()
         pattern_data = load_mystery_pattern(
             pattern_svg=Path(args.mystery_pattern).expanduser().resolve(),
             target_view_box=view_box,
-            max_step=args.max_segment_step,
+            max_step=mystery_max_step,
             fit_mode=args.mystery_fit,
+        )
+        elapsed = time.perf_counter() - stage_started_at
+        diagnostics.record("load-mystery-pattern", elapsed)
+        log_stage_timing(
+            "load-mystery-pattern",
+            elapsed,
+            args,
+            cells=len(pattern_data.cells),
+            max_step=mystery_max_step,
         )
         log_step(f"Patron preparado con {len(pattern_data.cells)} celdas", args)
         log_step("Fragmentando zonas con el patron", args)
-        zones, mystery_boundaries = apply_mystery_pattern(
+        stage_started_at = time.perf_counter()
+        zones, mystery_boundaries, mystery_stats = apply_mystery_pattern(
             zones=zones,
             pattern_data=pattern_data,
             min_fragment_area=args.mystery_min_fragment_area,
             min_fragment_ratio=args.mystery_min_fragment_ratio,
             max_fragments_per_zone=args.mystery_max_fragments_per_zone,
+        )
+        elapsed = time.perf_counter() - stage_started_at
+        diagnostics.record("apply-mystery-pattern", elapsed)
+        log_stage_timing(
+            "apply-mystery-pattern",
+            elapsed,
+            args,
+            zones_before=mystery_stats.zones_before,
+            zones_after=mystery_stats.zones_after,
+            split_attempts=mystery_stats.split_attempts,
+            bbox_skips=mystery_stats.bbox_skips,
+            fragments_generated=mystery_stats.fragments_generated,
+            fragments_kept=mystery_stats.fragments_kept,
+            zones_split=mystery_stats.zones_split,
+            rejected_small=mystery_stats.rejected_small,
+            rejected_ratio=mystery_stats.rejected_ratio,
+            unsplit_too_few=mystery_stats.zones_unsplit_too_few,
+            unsplit_over_limit=mystery_stats.zones_unsplit_over_limit,
         )
         log_step(f"Zonas tras mystery pattern: {len(zones)}", args)
 
@@ -1648,14 +1797,19 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple
         )
 
     log_step("Construyendo paleta y referencias", args)
+    stage_started_at = time.perf_counter()
     palette = sorted({zone.color_hex for zone in zones}, key=color_sort_key)
     if not palette:
         raise SvgToPdfError("La paleta numerable quedo vacia.")
 
     color_to_label = build_color_labels(palette)
+    elapsed = time.perf_counter() - stage_started_at
+    diagnostics.record("build-palette", elapsed)
+    log_stage_timing("build-palette", elapsed, args, colors=len(palette))
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     log_step(f"Renderizando PDF en {output_pdf}", args)
+    stage_started_at = time.perf_counter()
     placed, skipped = render_pdf(
         output_pdf=output_pdf,
         shapes=shapes,
@@ -1672,7 +1826,14 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple
         mystery_boundaries=mystery_boundaries,
         mystery_boundary_gray=args.mystery_boundary_gray,
         mystery_boundary_width=args.mystery_boundary_width,
+        args=args,
     )
+    elapsed = time.perf_counter() - stage_started_at
+    diagnostics.record("render-pdf-total", elapsed)
+    log_stage_timing("render-pdf-total", elapsed, args)
+
+    total_stages = sum(stage_elapsed for _, stage_elapsed in diagnostics.timings)
+    log_stage_timing("convert-total-profiled", total_stages, args)
 
     log_step("PDF terminado", args)
 
@@ -1756,6 +1917,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MYSTERY_BOUNDARY_WIDTH,
         help="Grosor de las divisiones internas del patron (pt).",
+    )
+    parser.add_argument(
+        "--mystery-max-segment-step",
+        type=float,
+        default=4.0,
+        help=(
+            "Paso maximo de muestreo especifico para el patron mystery. "
+            "Usa un valor mas alto para reducir CPU en la fragmentacion."
+        ),
     )
     parser.add_argument(
         "--representation-grey",
