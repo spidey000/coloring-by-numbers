@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Generated outputs
+*_paint_by_numbers.pdf
+output/
+pdf-output-*/

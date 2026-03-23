@@ -1,0 +1,3 @@
+reportlab>=4.1.0
+shapely>=2.0.0
+svgpathtools>=1.6.1
