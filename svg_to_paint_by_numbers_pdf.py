@@ -7,7 +7,8 @@ The output PDF contains:
 3) A bottom legend that maps each number to the original exact color.
 
 Notes:
-- Black is excluded from numbering and legend.
+- Pure black is always present in the legend.
+- Pure black labels are omitted only when a zone requires fallback placement.
 - Colors are sorted by HSV hue before assigning reference numbers.
 - Color references use one-character labels (1-9, then A-Z).
 """
@@ -132,6 +133,7 @@ class LabelPlacement:
     center_pdf_x: float
     center_pdf_y: float
     box_pdf: Tuple[float, float, float, float]
+    used_fallback: bool
 
 
 def local_name(tag: str) -> str:
@@ -747,7 +749,7 @@ def build_zones(
     zones: List[ColorZone] = []
 
     for shape in shapes:
-        if shape.fill_color and shape.fill_color != EXCLUDED_COLOR_HEX:
+        if shape.fill_color:
             fill_polys = path_to_fill_polygons(shape.path, max_step=max_step, min_area=min_area)
             for poly in fill_polys:
                 zones.append(ColorZone(color_hex=shape.fill_color, geometry=poly))
@@ -756,7 +758,6 @@ def build_zones(
             include_strokes
             and (not shape.fill_color)
             and shape.stroke_color
-            and shape.stroke_color != EXCLUDED_COLOR_HEX
         ):
             stroke_polys = path_to_stroke_polygons(
                 shape.path,
@@ -1108,6 +1109,7 @@ def label_placement(
                     center_pdf_x=center_x,
                     center_pdf_y=center_y,
                     box_pdf=box_pdf,
+                    used_fallback=False,
                 )
 
         min_x, min_y, max_x, max_y = base_poly.bounds
@@ -1150,6 +1152,7 @@ def label_placement(
                             center_pdf_x=center_x,
                             center_pdf_y=center_y,
                             box_pdf=box_pdf,
+                            used_fallback=False,
                         )
 
         size -= step
@@ -1175,6 +1178,7 @@ def label_placement(
         center_pdf_x=center_x,
         center_pdf_y=center_y,
         box_pdf=(x0, y0, x1, y1),
+        used_fallback=True,
     )
 
 
@@ -1207,6 +1211,10 @@ def draw_labels(
             max_font_size=max_font_size,
         )
         if placement is None:
+            skipped += 1
+            continue
+
+        if zone.color_hex == EXCLUDED_COLOR_HEX and placement.used_fallback:
             skipped += 1
             continue
 
@@ -1390,15 +1398,12 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple
     zones = normalize_nearest_black(zones)
     if not zones:
         raise SvgToPdfError(
-            "No se detectaron zonas rellenables con color distinto de negro."
+            "No se detectaron zonas rellenables en el SVG."
         )
 
-    palette = sorted(
-        {zone.color_hex for zone in zones if zone.color_hex != EXCLUDED_COLOR_HEX},
-        key=color_sort_key,
-    )
+    palette = sorted({zone.color_hex for zone in zones}, key=color_sort_key)
     if not palette:
-        raise SvgToPdfError("La paleta numerable quedo vacia (negro excluido).")
+        raise SvgToPdfError("La paleta numerable quedo vacia.")
 
     color_to_label = build_color_labels(palette)
 
@@ -1543,7 +1548,7 @@ def run_single_file(input_svg: Path, args: argparse.Namespace) -> int:
         return 3
 
     print(f"OK: PDF generado en {output_pdf}")
-    print(f"- Colores numerables (sin negro): {palette_count}")
+    print(f"- Colores numerables: {palette_count}")
     print(f"- Numeros colocados: {labels_placed}")
     print(f"- Zonas omitidas por falta de espacio: {labels_skipped}")
     return 0

@@ -6,7 +6,7 @@ Salida del PDF:
 
 1. Dibujo principal en fondo blanco con contornos tenues.
 2. Referencia interna por zonas (cada zona muestra un simbolo de un caracter para su color original).
-3. Leyenda inferior con todos los colores detectados (sin incluir negro), mostrando simbolo + cuadrado de color.
+3. Leyenda inferior con todos los colores detectados, incluyendo negro puro, mostrando simbolo + cuadrado de color.
 
 ## Requisitos
 
@@ -73,7 +73,8 @@ Cada SVG produce un PDF con el mismo nombre base dentro de esa carpeta.
 - Recorre elementos vectoriales (`path`, `rect`, `circle`, `ellipse`, `polygon`, `polyline`, `line`).
 - Resuelve estilos (`fill`, `stroke`, opacidades, estilos inline).
 - Normaliza color exacto a formato `#RRGGBB`.
-- Excluye `#000000` (contornos negros) de la paleta y de la leyenda.
+- Normaliza a `#000000` el color mas cercano al negro para asegurar una referencia negra pura.
+- `#000000` siempre aparece en la leyenda.
 
 ### 2) Ordenacion cromatica
 
@@ -98,6 +99,7 @@ Cada SVG produce un PDF con el mismo nombre base dentro de esa carpeta.
 - Evita superposiciones entre numeros en la colocacion normal con verificacion global de colision.
 - Si una posicion colisiona, prueba alternativas en bandas (dos lineas internas) y puntos de respaldo.
 - Si no se puede contener dentro de la zona, aplica fallback obligatorio: coloca centrado a `2 pt`, aunque salga del area.
+- Si una zona negra pura cae en fallback, no se dibuja su simbolo dentro del dibujo, pero su referencia sigue apareciendo en la leyenda.
 
 ### 5) Leyenda inferior
 
@@ -118,7 +120,7 @@ Cada SVG produce un PDF con el mismo nombre base dentro de esa carpeta.
 - Carpeta de entrada sin archivos `.svg`.
 - Fuente Montserrat no encontrada o no registrable.
 - SVG invalido o sin elementos vectoriales compatibles.
-- SVG sin zonas numerables (despues de excluir negro).
+- SVG sin zonas numerables.
 - Fallos inesperados durante parseo o exportacion.
 
 ## Limitaciones conocidas
