@@ -18,6 +18,7 @@ Salida del PDF:
 - `svg_to_paint_by_numbers_pdf.py`: script principal.
 - `fonts/Montserrat-Regular.ttf`: fuente usada para numeracion.
 - `inputs/`: carpeta recomendada para lotes de SVG.
+- `patterns/`: patrones SVG para modo mystery/ofuscado.
 - `output/`: PDFs generados.
 
 ## Instalacion
@@ -35,6 +36,7 @@ La fuente usada para los numeros es `Montserrat` y se carga desde:
 ```bash
 python svg_to_paint_by_numbers_pdf.py <archivo.svg>
 python svg_to_paint_by_numbers_pdf.py <archivo.svg> -o <salida.pdf>
+python svg_to_paint_by_numbers_pdf.py <archivo.svg> --mystery-pattern patterns/pattern.svg
 python svg_to_paint_by_numbers_pdf.py <carpeta_con_svgs>
 ```
 
@@ -42,6 +44,7 @@ Ejemplo con este repositorio:
 
 ```bash
 python svg_to_paint_by_numbers_pdf.py numbers.svg
+python svg_to_paint_by_numbers_pdf.py numbers.svg --mystery-pattern patterns/pattern.svg
 python svg_to_paint_by_numbers_pdf.py inputs
 ```
 
@@ -53,6 +56,8 @@ En modo carpeta, el script crea automaticamente una salida con timestamp dentro 
 
 Cada SVG produce un PDF con el mismo nombre base dentro de esa carpeta.
 
+Durante la ejecucion, el CLI muestra logs de progreso por etapa y el tiempo total acumulado hasta el PDF final.
+
 ## Opciones CLI principales
 
 - `--include-strokes`: incluye trazos sin relleno como zonas numerables (usa buffer geometrico por `stroke-width`).
@@ -60,6 +65,13 @@ Cada SVG produce un PDF con el mismo nombre base dentro de esa carpeta.
 - `--font-path`: ruta al TTF de Montserrat (por defecto `fonts/Montserrat-Regular.ttf`).
 - `-o/--output`: salida PDF explicita (solo modo archivo individual).
 - `--representation-grey OUTLINE NUMBER`: override de grises para contorno y numeros (0..1). Ejemplo: `--representation-grey 0.68 0.72`.
+- `--mystery-pattern`: aplica un SVG patron para fragmentar geometricamente todas las zonas del dibujo.
+- `--mystery-fit`: ajusta el patron al `viewBox` del dibujo (`contain`, `cover`, `stretch`).
+- `--mystery-min-fragment-area`: area minima para conservar un fragmento generado por el patron.
+- `--mystery-min-fragment-ratio`: proporcion minima respecto al area original para conservar un fragmento.
+- `--mystery-max-fragments-per-zone`: limite de fragmentos por zona; si se supera, esa zona no se divide.
+- `--mystery-boundary-grey`: tono gris de las divisiones internas del patron.
+- `--mystery-boundary-width`: grosor de las divisiones internas del patron.
 - `--min-font-size`: tamano minimo de numero (pt). El minimo efectivo siempre es `2`.
 - `--max-font-size`: tamano maximo de numero (pt). El maximo efectivo siempre es `6`.
 - `--line-width`: grosor de linea del dibujo principal (pt).
@@ -87,6 +99,8 @@ Cada SVG produce un PDF con el mismo nombre base dentro de esa carpeta.
 
 - No reutiliza rellenos de color originales en el arte final.
 - Traza toda la geometria con un gris tenue (default contorno `0.68`) sobre fondo blanco.
+- En modo mystery, puede fragmentar todas las zonas del dibujo usando un patron SVG superpuesto geometricamente.
+- Dibuja tambien las divisiones internas del patron con un gris configurable para ofuscar la lectura de la silueta.
 - Mantiene posiciones/proporciones del SVG dentro de una pagina A4.
 
 ### 4) Colocacion geometrica de numeros
@@ -113,6 +127,13 @@ Cada SVG produce un PDF con el mismo nombre base dentro de esa carpeta.
 
 - Genera el documento final con `reportlab`.
 - Pagina unica A4 con margenes razonables, dibujo principal y leyenda inferior.
+
+### 7) Modo mystery / ofuscado
+
+- Carga un `pattern.svg` independiente y lo ajusta al `viewBox` del dibujo.
+- Usa las fronteras del patron para dividir geometricamente las zonas coloreables.
+- Cada fragmento conserva el color original de su zona, por lo que la leyenda no cambia de concepto.
+- Si un fragmento resultante es demasiado pequeno o excesivo en cantidad, el sistema conserva la zona original.
 
 ## Manejo basico de errores
 

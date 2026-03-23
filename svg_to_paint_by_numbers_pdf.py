@@ -20,6 +20,7 @@ import colorsys
 import math
 import re
 import sys
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,8 +32,9 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
-from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Point, Polygon, box
-from shapely.ops import polylabel
+from shapely import affinity
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon, box
+from shapely.ops import polylabel, split, unary_union
 from svgpathtools import Arc, CubicBezier, Line, Path as SvgPath, QuadraticBezier, parse_path
 
 try:
@@ -75,10 +77,32 @@ LABEL_PADDING_PDF = 0.8
 LABEL_COLLISION_GAP_PDF = 0.6
 DEFAULT_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "Montserrat-Regular.ttf"
 REFERENCE_SYMBOLS = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+DEFAULT_MYSTERY_BOUNDARY_GRAY = 0.74
+DEFAULT_MYSTERY_BOUNDARY_WIDTH = 0.35
 
 
 class SvgToPdfError(Exception):
     """Domain error for conversion failures."""
+
+
+def format_elapsed(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    minutes, rem = divmod(seconds, 60.0)
+    hours, minutes = divmod(minutes, 60.0)
+    if hours >= 1:
+        return f"{int(hours)}h {int(minutes)}m {rem:04.1f}s"
+    if minutes >= 1:
+        return f"{int(minutes)}m {rem:04.1f}s"
+    return f"{seconds:0.2f}s"
+
+
+def log_step(message: str, args: Optional[argparse.Namespace] = None) -> None:
+    prefix = "[paint-numbers]"
+    if args is not None and hasattr(args, "command_started_at"):
+        elapsed = format_elapsed(time.perf_counter() - args.command_started_at)
+        print(f"{prefix} +{elapsed} {message}")
+        return
+    print(f"{prefix} {message}")
 
 
 @dataclass
@@ -134,6 +158,14 @@ class LabelPlacement:
     center_pdf_y: float
     box_pdf: Tuple[float, float, float, float]
     used_fallback: bool
+
+
+@dataclass
+class MysteryPatternData:
+    """Prepared pattern cells and drawable internal boundaries."""
+
+    cells: List[Polygon]
+    boundary_lines: Optional[object]
 
 
 def local_name(tag: str) -> str:
@@ -771,6 +803,126 @@ def build_zones(
     return zones
 
 
+def transform_geometry_to_view_box(
+    geometry,
+    source_view_box: Tuple[float, float, float, float],
+    target_view_box: Tuple[float, float, float, float],
+    fit_mode: str,
+):
+    src_min_x, src_min_y, src_w, src_h = source_view_box
+    dst_min_x, dst_min_y, dst_w, dst_h = target_view_box
+    if src_w <= 0 or src_h <= 0 or dst_w <= 0 or dst_h <= 0:
+        return geometry
+
+    scale_x = dst_w / src_w
+    scale_y = dst_h / src_h
+    fit_mode = fit_mode.lower()
+    if fit_mode == "stretch":
+        sx = scale_x
+        sy = scale_y
+        offset_x = dst_min_x - (src_min_x * sx)
+        offset_y = dst_min_y - (src_min_y * sy)
+    else:
+        uniform_scale = max(scale_x, scale_y) if fit_mode == "cover" else min(scale_x, scale_y)
+        sx = uniform_scale
+        sy = uniform_scale
+        scaled_w = src_w * uniform_scale
+        scaled_h = src_h * uniform_scale
+        offset_x = dst_min_x + ((dst_w - scaled_w) / 2.0) - (src_min_x * uniform_scale)
+        offset_y = dst_min_y + ((dst_h - scaled_h) / 2.0) - (src_min_y * uniform_scale)
+
+    scaled = affinity.scale(geometry, xfact=sx, yfact=sy, origin=(0.0, 0.0))
+    return affinity.translate(scaled, xoff=offset_x, yoff=offset_y)
+
+
+def load_mystery_pattern(
+    pattern_svg: Path,
+    target_view_box: Tuple[float, float, float, float],
+    max_step: float,
+    fit_mode: str,
+) -> MysteryPatternData:
+    shapes, pattern_view_box = read_svg(pattern_svg)
+    cells: List[Polygon] = []
+
+    for shape in shapes:
+        for poly in path_to_fill_polygons(shape.path, max_step=max_step, min_area=0.0):
+            transformed = safe_make_valid(
+                transform_geometry_to_view_box(poly, pattern_view_box, target_view_box, fit_mode)
+            )
+            for out_poly in iter_polygons(transformed):
+                if out_poly.area > 0:
+                    cells.append(out_poly)
+
+    if not cells:
+        raise SvgToPdfError("El pattern SVG no produjo celdas geometrizadas utilizables.")
+
+    boundary_lines = unary_union([cell.boundary for cell in cells])
+    return MysteryPatternData(cells=cells, boundary_lines=boundary_lines)
+
+
+def split_zone_by_pattern(
+    zone: ColorZone,
+    pattern_lines,
+    min_fragment_area: float,
+    min_fragment_ratio: float,
+    max_fragments_per_zone: int,
+) -> List[ColorZone]:
+    try:
+        fragments = split(zone.geometry, pattern_lines)
+    except Exception:
+        return [zone]
+
+    zone_area = max(zone.geometry.area, 1e-9)
+    kept: List[ColorZone] = []
+    for fragment in getattr(fragments, "geoms", [fragments]):
+        for poly in iter_polygons(safe_make_valid(fragment)):
+            if poly.area <= 0:
+                continue
+            if poly.area < min_fragment_area:
+                continue
+            if (poly.area / zone_area) < min_fragment_ratio:
+                continue
+            kept.append(ColorZone(color_hex=zone.color_hex, geometry=poly))
+
+    if len(kept) < 2:
+        return [zone]
+    if max_fragments_per_zone > 0 and len(kept) > max_fragments_per_zone:
+        return [zone]
+    return kept
+
+
+def apply_mystery_pattern(
+    zones: Sequence[ColorZone],
+    pattern_data: MysteryPatternData,
+    min_fragment_area: float,
+    min_fragment_ratio: float,
+    max_fragments_per_zone: int,
+) -> Tuple[List[ColorZone], Optional[object]]:
+    pattern_lines = pattern_data.boundary_lines
+    if pattern_lines is None or getattr(pattern_lines, "is_empty", False):
+        return list(zones), None
+
+    split_zones: List[ColorZone] = []
+    union_geometries = []
+    for zone in zones:
+        parts = split_zone_by_pattern(
+            zone=zone,
+            pattern_lines=pattern_lines,
+            min_fragment_area=min_fragment_area,
+            min_fragment_ratio=min_fragment_ratio,
+            max_fragments_per_zone=max_fragments_per_zone,
+        )
+        split_zones.extend(parts)
+        union_geometries.extend([part.geometry for part in parts])
+
+    if not union_geometries:
+        return list(zones), None
+
+    drawing_union = unary_union(union_geometries)
+    clipped_boundaries = safe_make_valid(pattern_lines.intersection(drawing_union))
+    return split_zones, clipped_boundaries
+
+
 def build_layout(
     page_width: float,
     page_height: float,
@@ -864,6 +1016,63 @@ def draw_black_outline(
     pdf.setLineWidth(line_width)
     pdf.setStrokeGray(outline_gray)
     pdf.drawPath(path_obj, stroke=1, fill=0)
+
+
+def iter_line_strings(geometry) -> Iterator[LineString]:
+    if geometry is None:
+        return
+    if getattr(geometry, "is_empty", True):
+        return
+    if isinstance(geometry, LineString):
+        yield geometry
+        return
+    if isinstance(geometry, MultiLineString):
+        for line in geometry.geoms:
+            if not line.is_empty:
+                yield line
+        return
+    if isinstance(geometry, Polygon):
+        yield geometry.exterior
+        for interior in geometry.interiors:
+            yield LineString(interior.coords)
+        return
+    if isinstance(geometry, MultiPolygon):
+        for poly in geometry.geoms:
+            yield from iter_line_strings(poly)
+        return
+    if isinstance(geometry, GeometryCollection):
+        for item in geometry.geoms:
+            yield from iter_line_strings(item)
+
+
+def draw_line_geometry(
+    pdf: canvas.Canvas,
+    geometry,
+    transform: LayoutTransform,
+    line_width: float,
+    stroke_gray: float,
+) -> None:
+    if geometry is None or getattr(geometry, "is_empty", True):
+        return
+
+    pdf.setLineWidth(line_width)
+    pdf.setStrokeGray(stroke_gray)
+    path_obj = pdf.beginPath()
+    drawn = False
+
+    for line in iter_line_strings(geometry):
+        coords = list(line.coords)
+        if len(coords) < 2:
+            continue
+        start_x, start_y = transform.map_xy(coords[0][0], coords[0][1])
+        path_obj.moveTo(start_x, start_y)
+        for x, y in coords[1:]:
+            px, py = transform.map_xy(x, y)
+            path_obj.lineTo(px, py)
+        drawn = True
+
+    if drawn:
+        pdf.drawPath(path_obj, stroke=1, fill=0)
 
 
 def pick_polygon_for_label(geometry) -> Optional[Polygon]:
@@ -1342,6 +1551,9 @@ def render_pdf(
     show_hex: bool,
     outline_gray: float,
     number_gray: float,
+    mystery_boundaries=None,
+    mystery_boundary_gray: float = DEFAULT_MYSTERY_BOUNDARY_GRAY,
+    mystery_boundary_width: float = DEFAULT_MYSTERY_BOUNDARY_WIDTH,
 ) -> Tuple[int, int]:
     page_width, page_height = A4
     legend_height = compute_legend_height(len(palette))
@@ -1361,6 +1573,14 @@ def render_pdf(
             line_width=line_width,
             outline_gray=outline_gray,
         )
+
+    draw_line_geometry(
+        pdf,
+        geometry=mystery_boundaries,
+        transform=transform,
+        line_width=mystery_boundary_width,
+        stroke_gray=mystery_boundary_gray,
+    )
 
     placed, skipped = draw_labels(
         pdf,
@@ -1387,20 +1607,47 @@ def render_pdf(
 
 
 def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple[int, int, int]:
+    log_step(f"Leyendo SVG base: {svg_path.name}", args)
     shapes, view_box = read_svg(svg_path)
+    mystery_boundaries = None
 
+    log_step("Extrayendo zonas coloreables", args)
     zones = build_zones(
         shapes,
         include_strokes=args.include_strokes,
         max_step=args.max_segment_step,
         min_area=args.min_area,
     )
+    log_step(f"Zonas iniciales detectadas: {len(zones)}", args)
+
+    log_step("Normalizando color mas cercano al negro puro", args)
     zones = normalize_nearest_black(zones)
+
+    if args.mystery_pattern:
+        log_step(f"Cargando patron mystery: {Path(args.mystery_pattern).name}", args)
+        pattern_data = load_mystery_pattern(
+            pattern_svg=Path(args.mystery_pattern).expanduser().resolve(),
+            target_view_box=view_box,
+            max_step=args.max_segment_step,
+            fit_mode=args.mystery_fit,
+        )
+        log_step(f"Patron preparado con {len(pattern_data.cells)} celdas", args)
+        log_step("Fragmentando zonas con el patron", args)
+        zones, mystery_boundaries = apply_mystery_pattern(
+            zones=zones,
+            pattern_data=pattern_data,
+            min_fragment_area=args.mystery_min_fragment_area,
+            min_fragment_ratio=args.mystery_min_fragment_ratio,
+            max_fragments_per_zone=args.mystery_max_fragments_per_zone,
+        )
+        log_step(f"Zonas tras mystery pattern: {len(zones)}", args)
+
     if not zones:
         raise SvgToPdfError(
             "No se detectaron zonas rellenables en el SVG."
         )
 
+    log_step("Construyendo paleta y referencias", args)
     palette = sorted({zone.color_hex for zone in zones}, key=color_sort_key)
     if not palette:
         raise SvgToPdfError("La paleta numerable quedo vacia.")
@@ -1408,6 +1655,7 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple
     color_to_label = build_color_labels(palette)
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
+    log_step(f"Renderizando PDF en {output_pdf}", args)
     placed, skipped = render_pdf(
         output_pdf=output_pdf,
         shapes=shapes,
@@ -1421,7 +1669,12 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple
         show_hex=args.show_hex,
         outline_gray=args.outline_gray,
         number_gray=args.number_gray,
+        mystery_boundaries=mystery_boundaries,
+        mystery_boundary_gray=args.mystery_boundary_gray,
+        mystery_boundary_width=args.mystery_boundary_width,
     )
+
+    log_step("PDF terminado", args)
 
     return len(palette), placed, skipped
 
@@ -1461,6 +1714,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--show-hex",
         action="store_true",
         help="Muestra tambien el codigo HEX en la leyenda.",
+    )
+    parser.add_argument(
+        "--mystery-pattern",
+        help="Ruta a un SVG patron para fragmentar geometricamente todo el dibujo.",
+    )
+    parser.add_argument(
+        "--mystery-fit",
+        choices=("contain", "cover", "stretch"),
+        default="cover",
+        help="Modo de ajuste del patron sobre el viewBox del dibujo.",
+    )
+    parser.add_argument(
+        "--mystery-min-fragment-area",
+        type=float,
+        default=12.0,
+        help="Area minima para conservar un fragmento generado por el patron.",
+    )
+    parser.add_argument(
+        "--mystery-min-fragment-ratio",
+        type=float,
+        default=0.015,
+        help="Proporcion minima respecto al area de la zona original para conservar un fragmento.",
+    )
+    parser.add_argument(
+        "--mystery-max-fragments-per-zone",
+        type=int,
+        default=24,
+        help="Limite de fragmentos por zona; si se supera, esa zona no se divide.",
+    )
+    parser.add_argument(
+        "--mystery-boundary-grey",
+        "--mystery-boundary-gray",
+        dest="mystery_boundary_gray",
+        type=float,
+        default=DEFAULT_MYSTERY_BOUNDARY_GRAY,
+        help="Tono gris para las divisiones internas del patron (0..1).",
+    )
+    parser.add_argument(
+        "--mystery-boundary-width",
+        type=float,
+        default=DEFAULT_MYSTERY_BOUNDARY_WIDTH,
+        help="Grosor de las divisiones internas del patron (pt).",
     )
     parser.add_argument(
         "--representation-grey",
@@ -1537,6 +1832,8 @@ def run_single_file(input_svg: Path, args: argparse.Namespace) -> int:
         return 1
 
     output_pdf = resolve_single_output_path(input_svg, args.output)
+    log_step(f"Iniciando modo archivo para {input_svg.name}", args)
+    log_step(f"Salida prevista: {output_pdf}", args)
 
     try:
         palette_count, labels_placed, labels_skipped = convert(input_svg, output_pdf, args)
@@ -1547,10 +1844,12 @@ def run_single_file(input_svg: Path, args: argparse.Namespace) -> int:
         print(f"Error inesperado: {exc}", file=sys.stderr)
         return 3
 
+    total_elapsed = format_elapsed(time.perf_counter() - args.command_started_at)
     print(f"OK: PDF generado en {output_pdf}")
     print(f"- Colores numerables: {palette_count}")
     print(f"- Numeros colocados: {labels_placed}")
     print(f"- Zonas omitidas por falta de espacio: {labels_skipped}")
+    print(f"- Tiempo total: {total_elapsed}")
     return 0
 
 
@@ -1580,16 +1879,20 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
     ok_count = 0
     fail_count = 0
 
+    log_step(f"Iniciando modo batch en {input_dir}", args)
     print(f"Batch: {len(svg_files)} SVG(s) detectados en {input_dir}")
     print(f"Batch: salida en {batch_output_dir}")
 
     for svg_file in svg_files:
         output_pdf = batch_output_dir / f"{svg_file.stem}.pdf"
+        file_started_at = time.perf_counter()
+        log_step(f"Procesando archivo batch: {svg_file.name}", args)
         try:
             palette_count, labels_placed, labels_skipped = convert(svg_file, output_pdf, args)
             print(
                 f"[OK] {svg_file.name} -> {output_pdf.name} | "
-                f"colores: {palette_count}, colocados: {labels_placed}, omitidos: {labels_skipped}"
+                f"colores: {palette_count}, colocados: {labels_placed}, omitidos: {labels_skipped}, "
+                f"tiempo: {format_elapsed(time.perf_counter() - file_started_at)}"
             )
             ok_count += 1
         except SvgToPdfError as exc:
@@ -1604,6 +1907,7 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
     print(f"- PDFs generados: {ok_count}")
     print(f"- Fallidos: {fail_count}")
     print(f"- Carpeta de salida: {batch_output_dir}")
+    print(f"- Tiempo total: {format_elapsed(time.perf_counter() - args.command_started_at)}")
 
     if fail_count > 0:
         return 4
@@ -1640,6 +1944,7 @@ def resolve_representation_grays(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    args.command_started_at = time.perf_counter()
 
     input_path = Path(args.input_path).expanduser().resolve()
     if not input_path.exists():
@@ -1648,14 +1953,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         outline_gray, number_gray = resolve_representation_grays(args.representation_grey)
+        mystery_boundary_gray = validate_gray_value(
+            args.mystery_boundary_gray,
+            "Mystery boundary grey",
+        )
     except SvgToPdfError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     args.outline_gray = outline_gray
     args.number_gray = number_gray
+    args.mystery_boundary_gray = mystery_boundary_gray
+    log_step("Argumentos validados", args)
 
     font_path = Path(args.font_path).expanduser().resolve()
     try:
+        log_step(f"Registrando fuente desde {font_path}", args)
         register_montserrat_font(font_path)
     except SvgToPdfError as exc:
         print(f"Error: {exc}", file=sys.stderr)
