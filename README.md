@@ -56,7 +56,9 @@ En modo carpeta, el script crea automaticamente una salida con timestamp dentro 
 
 Cada SVG produce un PDF con el mismo nombre base dentro de esa carpeta.
 
-Durante la ejecucion, el CLI muestra logs de progreso por etapa y el tiempo total acumulado hasta el PDF final.
+Durante la ejecucion, el CLI muestra un checklist de etapas con `[x]`, `[>]` y `[ ]`, junto con tiempo transcurrido y ETA aproximado.
+
+En `render-labels`, ademas muestra progreso en vivo por zonas y un contador aproximado de `checks` geometricos para que se vea cuanto falta cuando el trabajo interno es grande.
 
 ## Opciones CLI principales
 

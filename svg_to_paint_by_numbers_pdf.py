@@ -33,9 +33,10 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
-from shapely import affinity
+from shapely.prepared import prep
+from shapely import STRtree, affinity
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon, box
-from shapely.ops import polylabel, split, unary_union
+from shapely.ops import polylabel, unary_union
 from svgpathtools import Arc, CubicBezier, Line, Path as SvgPath, QuadraticBezier, parse_path
 
 try:
@@ -80,6 +81,8 @@ DEFAULT_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "Montserrat-Regu
 REFERENCE_SYMBOLS = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 DEFAULT_MYSTERY_BOUNDARY_GRAY = 0.74
 DEFAULT_MYSTERY_BOUNDARY_WIDTH = 0.35
+PROGRESS_RENDER_INTERVAL = 0.8
+PROGRESS_CHECK_FLUSH_INTERVAL = 250
 
 
 class SvgToPdfError(Exception):
@@ -167,6 +170,7 @@ class MysteryPatternData:
 
     cells: List[Polygon]
     boundary_lines: Optional[object]
+    cell_tree: Optional[STRtree] = None
 
 
 @dataclass
@@ -190,10 +194,282 @@ class MysterySplitStats:
 class StageDiagnostics:
     """Accumulates per-stage timing data for a conversion."""
 
-    timings: List[Tuple[str, float]] = field(default_factory=list)
+    timings: List[Tuple[str, float, Dict[str, object]]] = field(default_factory=list)
 
-    def record(self, stage_name: str, elapsed: float) -> None:
-        self.timings.append((stage_name, elapsed))
+    def record(self, stage_name: str, elapsed: float, **metrics: object) -> None:
+        self.timings.append((stage_name, elapsed, dict(metrics)))
+
+
+@dataclass
+class ProgressStep:
+    key: str
+    label: str
+
+
+@dataclass
+class ActiveProgress:
+    key: str
+    label: str
+    started_at: float
+    total_items: Optional[int] = None
+    completed_items: int = 0
+    unit_label: Optional[str] = None
+    detail_label: Optional[str] = None
+    detail_completed: int = 0
+    last_percent_reported: int = -1
+
+
+class CliProgressReporter:
+    def __init__(
+        self,
+        *,
+        steps: Sequence[ProgressStep],
+        started_at: float,
+        stage_estimates: Optional[Dict[str, float]] = None,
+    ) -> None:
+        self.steps = list(steps)
+        self.started_at = started_at
+        self.stage_estimates = dict(stage_estimates or {})
+        self.step_index = {step.key: index for index, step in enumerate(self.steps)}
+        self.completed_keys = set()
+        self.active: Optional[ActiveProgress] = None
+        self.last_render_at = 0.0
+
+    def start_step(
+        self,
+        key: str,
+        *,
+        total_items: Optional[int] = None,
+        unit_label: Optional[str] = None,
+        detail_label: Optional[str] = None,
+    ) -> None:
+        step = self.steps[self.step_index[key]]
+        self.active = ActiveProgress(
+            key=key,
+            label=step.label,
+            started_at=time.perf_counter(),
+            total_items=total_items,
+            unit_label=unit_label,
+            detail_label=detail_label,
+        )
+        self.render(force=True)
+
+    def advance_items(self, count: int = 1) -> None:
+        if self.active is None or count <= 0:
+            return
+        self.active.completed_items += count
+        self.render()
+
+    def advance_detail(self, count: int = 1) -> None:
+        if self.active is None or count <= 0:
+            return
+        self.active.detail_completed += count
+        self.render()
+
+    def complete_step(self, key: str, actual_duration: Optional[float] = None) -> None:
+        if actual_duration is not None:
+            self.stage_estimates[key] = actual_duration
+        self.completed_keys.add(key)
+        if self.active is not None and self.active.key == key:
+            self.active = None
+        self.render(force=True)
+
+    def render(self, force: bool = False) -> None:
+        now = time.perf_counter()
+        if not force and self.active is not None and self.active.total_items:
+            percent = int((self.active.completed_items * 100) / max(self.active.total_items, 1))
+            step_size = self._progress_percent_step(self.active)
+            milestone = percent // step_size
+            progressed = milestone > self.active.last_percent_reported
+            if progressed:
+                self.active.last_percent_reported = milestone
+            if not progressed and (now - self.last_render_at) < PROGRESS_RENDER_INTERVAL:
+                return
+        elif not force and (now - self.last_render_at) < PROGRESS_RENDER_INTERVAL:
+            return
+
+        self.last_render_at = now
+        parts = []
+        active_key = self.active.key if self.active is not None else None
+        for step in self.steps:
+            if step.key in self.completed_keys:
+                marker = "[x]"
+            elif step.key == active_key:
+                marker = "[>]"
+            else:
+                marker = "[ ]"
+            parts.append(f"{marker} {step.label}")
+        print(f"[paint-numbers][progress] {' | '.join(parts)}")
+
+        if self.active is None:
+            total_elapsed = format_elapsed(now - self.started_at)
+            print(f"[paint-numbers][progress] transcurrido total: {total_elapsed}")
+            return
+
+        active = self.active
+        step_elapsed = now - active.started_at
+        total_elapsed = now - self.started_at
+        summary = [f"paso: {active.label}"]
+        if active.total_items is not None:
+            percent = (active.completed_items / max(active.total_items, 1)) * 100.0
+            summary.append(
+                f"{active.completed_items}/{active.total_items} {active.unit_label or 'items'} ({percent:0.1f}%)"
+            )
+        if active.detail_label and active.detail_completed > 0:
+            detail_text = f"{active.detail_label}: {active.detail_completed}"
+            detail_total = self._estimate_detail_total(active)
+            if detail_total is not None:
+                detail_text += f"/~{detail_total}"
+            summary.append(detail_text)
+
+        summary.append(f"transcurrido: {format_elapsed(total_elapsed)}")
+        summary.append(f"paso: {format_elapsed(step_elapsed)}")
+
+        remaining = self._estimate_remaining_total(now)
+        if remaining is not None:
+            summary.append(f"ETA: {format_elapsed(remaining)}")
+
+        print(f"[paint-numbers][progress] {' | '.join(summary)}")
+
+    def _estimate_active_total(self, now: float) -> Optional[float]:
+        if self.active is None:
+            return None
+        active = self.active
+        elapsed = now - active.started_at
+        if active.total_items is not None and active.completed_items > 0:
+            return elapsed * (active.total_items / active.completed_items)
+        historical = self.stage_estimates.get(active.key)
+        if historical is not None and historical > 0:
+            return historical
+        return None
+
+    def _progress_percent_step(self, active: ActiveProgress) -> int:
+        if active.detail_label:
+            return 2
+        if active.unit_label == "formas":
+            return 10
+        return 5
+
+    def _estimate_detail_total(self, active: ActiveProgress) -> Optional[int]:
+        if active.total_items is None or active.completed_items <= 0 or active.detail_completed <= 0:
+            return None
+        estimated = (active.detail_completed / active.completed_items) * active.total_items
+        return max(active.detail_completed, int(round(estimated)))
+
+    def _estimate_remaining_total(self, now: float) -> Optional[float]:
+        remaining = 0.0
+        has_estimate = False
+
+        active_total = self._estimate_active_total(now)
+        if self.active is not None and active_total is not None:
+            elapsed = now - self.active.started_at
+            remaining += max(0.0, active_total - elapsed)
+            has_estimate = True
+
+        for step in self.steps:
+            if step.key in self.completed_keys:
+                continue
+            if self.active is not None and step.key == self.active.key:
+                continue
+            estimate = self.stage_estimates.get(step.key)
+            if estimate is None:
+                continue
+            remaining += estimate
+            has_estimate = True
+
+        if not has_estimate:
+            return None
+        return remaining
+
+
+@dataclass
+class LabelZoneProfile:
+    """Detailed timing snapshot for a single zone label-placement attempt."""
+
+    zone_index: int
+    color_hex: str
+    label: str
+    area: float
+    elapsed: float = 0.0
+    result: str = "unknown"
+    font_sizes_tried: int = 0
+    base_candidates: int = 0
+    direct_candidate_checks: int = 0
+    grid_candidate_checks: int = 0
+    collision_rejects: int = 0
+    used_fallback: bool = False
+    used_grid: bool = False
+
+
+@dataclass
+class LabelRenderDiagnostics:
+    """Aggregated timings and counters for render-labels internals."""
+
+    timings: Dict[str, float] = field(default_factory=dict)
+    counters: Dict[str, int] = field(default_factory=dict)
+    slowest_zones: List[LabelZoneProfile] = field(default_factory=list)
+    max_slowest_zones: int = 15
+
+    def add_time(self, name: str, elapsed: float) -> None:
+        self.timings[name] = self.timings.get(name, 0.0) + elapsed
+
+    def inc(self, name: str, amount: int = 1) -> None:
+        self.counters[name] = self.counters.get(name, 0) + amount
+
+    def add_zone_profile(self, profile: LabelZoneProfile) -> None:
+        self.slowest_zones.append(profile)
+        self.slowest_zones.sort(key=lambda item: item.elapsed, reverse=True)
+        if len(self.slowest_zones) > self.max_slowest_zones:
+            self.slowest_zones = self.slowest_zones[: self.max_slowest_zones]
+
+
+@dataclass
+class ConvertResult:
+    """Final conversion summary and diagnostics."""
+
+    palette_count: int
+    labels_placed: int
+    labels_skipped: int
+    stage_diagnostics: StageDiagnostics
+    label_diagnostics: Optional[LabelRenderDiagnostics] = None
+    log_file_path: Optional[Path] = None
+
+
+@dataclass
+class LabelCollisionIndex:
+    """Spatial hash for placed label boxes in PDF coordinates."""
+
+    cell_size: float = 12.0
+    buckets: Dict[Tuple[int, int], List[Tuple[float, float, float, float]]] = field(default_factory=dict)
+
+    def _bucket_range(self, box_pdf: Tuple[float, float, float, float]) -> Tuple[int, int, int, int]:
+        x0, y0, x1, y1 = box_pdf
+        gap = LABEL_COLLISION_GAP_PDF
+        min_x = math.floor((x0 - gap) / self.cell_size)
+        max_x = math.floor((x1 + gap) / self.cell_size)
+        min_y = math.floor((y0 - gap) / self.cell_size)
+        max_y = math.floor((y1 + gap) / self.cell_size)
+        return min_x, max_x, min_y, max_y
+
+    def collides(self, box_pdf: Tuple[float, float, float, float]) -> bool:
+        min_x, max_x, min_y, max_y = self._bucket_range(box_pdf)
+        seen = set()
+        for by in range(min_y, max_y + 1):
+            for bx in range(min_x, max_x + 1):
+                for existing in self.buckets.get((bx, by), []):
+                    key = id(existing)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if boxes_overlap(box_pdf, existing, gap=LABEL_COLLISION_GAP_PDF):
+                        return True
+        return False
+
+    def add(self, box_pdf: Tuple[float, float, float, float]) -> None:
+        min_x, max_x, min_y, max_y = self._bucket_range(box_pdf)
+        for by in range(min_y, max_y + 1):
+            for bx in range(min_x, max_x + 1):
+                self.buckets.setdefault((bx, by), []).append(box_pdf)
 
 
 def log_stage_timing(
@@ -205,6 +481,191 @@ def log_stage_timing(
     details = [f"{key}: {value}" for key, value in metrics.items() if value is not None]
     suffix = f" | {' | '.join(details)}" if details else ""
     log_step(f"Etapa {stage_name}: {format_elapsed(elapsed)}{suffix}", args)
+
+
+def format_ratio(part: float, total: float) -> str:
+    if total <= 0:
+        return "0.0%"
+    return f"{(part / total) * 100.0:0.1f}%"
+
+
+def parse_elapsed_text(text: str) -> Optional[float]:
+    payload = text.strip()
+    if not payload:
+        return None
+    total = 0.0
+    found = False
+    for amount, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([hms])", payload):
+        value = float(amount)
+        if unit == "h":
+            total += value * 3600.0
+        elif unit == "m":
+            total += value * 60.0
+        else:
+            total += value
+        found = True
+    if found:
+        return total
+    return None
+
+
+def load_stage_estimates_from_logs(output_pdf: Path) -> Dict[str, float]:
+    log_pattern = f"{output_pdf.stem}_log_*.txt"
+    candidates = sorted(output_pdf.parent.glob(log_pattern), key=lambda path: path.name, reverse=True)
+    for log_path in candidates:
+        try:
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+
+        stage_estimates: Dict[str, float] = {}
+        in_stage_section = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped == "stage_timings":
+                in_stage_section = True
+                continue
+            if not in_stage_section:
+                continue
+            if not stripped:
+                break
+            match = re.match(r"^- ([^:]+): ([^|]+)", stripped)
+            if not match:
+                continue
+            stage_name = match.group(1).strip()
+            elapsed = parse_elapsed_text(match.group(2).strip())
+            if elapsed is not None:
+                stage_estimates[stage_name] = elapsed
+        if stage_estimates:
+            return stage_estimates
+    return {}
+
+
+def build_progress_steps(args: argparse.Namespace) -> List[ProgressStep]:
+    steps = [
+        ProgressStep("read-svg", "leer SVG"),
+        ProgressStep("build-zones", "zonas"),
+        ProgressStep("normalize-black", "normalizar negro"),
+    ]
+    if args.mystery_pattern:
+        steps.extend([
+            ProgressStep("load-mystery-pattern", "cargar patron"),
+            ProgressStep("apply-mystery-pattern", "fragmentar"),
+        ])
+    steps.extend([
+        ProgressStep("build-palette", "paleta"),
+        ProgressStep("render-outline", "contornos"),
+        ProgressStep("render-mystery-boundaries", "divisiones"),
+        ProgressStep("render-labels", "labels"),
+        ProgressStep("render-legend", "leyenda"),
+        ProgressStep("render-save", "guardar"),
+    ])
+    return steps
+
+
+def make_test_log_path(output_pdf: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return output_pdf.with_name(f"{output_pdf.stem}_log_{stamp}.txt")
+
+
+def build_test_log_text(
+    *,
+    input_svg: Path,
+    output_pdf: Path,
+    result: ConvertResult,
+    args: argparse.Namespace,
+) -> str:
+    total_profiled = profiled_total_elapsed(result.stage_diagnostics)
+    lines = [
+        "paint-by-numbers profiling log",
+        f"generated_at: {datetime.now().isoformat(timespec='seconds')}",
+        f"input_svg: {input_svg}",
+        f"output_pdf: {output_pdf}",
+        f"test_mode: {bool(getattr(args, 'test', False))}",
+        "",
+        "summary",
+        f"- palette_count: {result.palette_count}",
+        f"- labels_placed: {result.labels_placed}",
+        f"- labels_skipped: {result.labels_skipped}",
+        f"- total_profiled: {format_elapsed(total_profiled)}",
+        "",
+        "stage_timings",
+    ]
+
+    for stage_name, elapsed, metrics in result.stage_diagnostics.timings:
+        metric_text = " | ".join(f"{key}: {value}" for key, value in metrics.items())
+        suffix = f" | {metric_text}" if metric_text else ""
+        lines.append(
+            f"- {stage_name}: {format_elapsed(elapsed)} ({format_ratio(elapsed, total_profiled)}){suffix}"
+        )
+
+    label_diag = result.label_diagnostics
+    if label_diag is not None:
+        label_total = label_diag.timings.get("render-labels-total", 0.0)
+        lines.extend([
+            "",
+            "render_labels_breakdown",
+            f"- total: {format_elapsed(label_total)}",
+        ])
+
+        for name in sorted(label_diag.timings):
+            if name == "render-labels-total":
+                continue
+            elapsed = label_diag.timings[name]
+            lines.append(f"- {name}: {format_elapsed(elapsed)} ({format_ratio(elapsed, label_total)})")
+
+        lines.extend([
+            "",
+            "render_labels_counters",
+        ])
+        for name in sorted(label_diag.counters):
+            lines.append(f"- {name}: {label_diag.counters[name]}")
+
+        if label_diag.slowest_zones:
+            lines.extend([
+                "",
+                "slowest_label_zones",
+            ])
+            for profile in label_diag.slowest_zones:
+                lines.append(
+                    "- "
+                    f"zone={profile.zone_index} | label={profile.label} | color={profile.color_hex} | "
+                    f"area={profile.area:0.2f} | elapsed={format_elapsed(profile.elapsed)} | "
+                    f"result={profile.result} | font_sizes={profile.font_sizes_tried} | "
+                    f"base_candidates={profile.base_candidates} | direct_checks={profile.direct_candidate_checks} | "
+                    f"grid_checks={profile.grid_candidate_checks} | collision_rejects={profile.collision_rejects} | "
+                    f"used_grid={profile.used_grid} | used_fallback={profile.used_fallback}"
+                )
+
+    return "\n".join(lines) + "\n"
+
+
+def profiled_total_elapsed(stage_diagnostics: StageDiagnostics) -> float:
+    nested_render_stages = {
+        "render-outline",
+        "render-mystery-boundaries",
+        "render-labels",
+        "render-legend",
+        "render-save",
+    }
+    return sum(
+        elapsed
+        for stage_name, elapsed, _ in stage_diagnostics.timings
+        if stage_name not in nested_render_stages
+    )
+
+
+def write_test_log(
+    *,
+    input_svg: Path,
+    output_pdf: Path,
+    result: ConvertResult,
+    args: argparse.Namespace,
+) -> Path:
+    log_path = make_test_log_path(output_pdf)
+    log_text = build_test_log_text(input_svg=input_svg, output_pdf=output_pdf, result=result, args=args)
+    log_path.write_text(log_text, encoding="utf-8")
+    return log_path
 
 
 def local_name(tag: str) -> str:
@@ -910,29 +1371,32 @@ def load_mystery_pattern(
         raise SvgToPdfError("El pattern SVG no produjo celdas geometrizadas utilizables.")
 
     boundary_lines = unary_union([cell.boundary for cell in cells])
-    return MysteryPatternData(cells=cells, boundary_lines=boundary_lines)
+    cell_tree = STRtree(cells)
+    return MysteryPatternData(cells=cells, boundary_lines=boundary_lines, cell_tree=cell_tree)
 
 
-def split_zone_by_pattern(
+def fragment_zone_by_cells(
     zone: ColorZone,
-    pattern_lines,
+    candidate_cells: Sequence[Polygon],
     min_fragment_area: float,
     min_fragment_ratio: float,
     max_fragments_per_zone: int,
     stats: Optional[MysterySplitStats] = None,
 ) -> List[ColorZone]:
-    try:
-        fragments = split(zone.geometry, pattern_lines)
-    except Exception:
+    if not candidate_cells:
         return [zone]
 
     zone_area = max(zone.geometry.area, 1e-9)
     kept: List[ColorZone] = []
-    raw_fragments = list(getattr(fragments, "geoms", [fragments]))
     if stats is not None:
-        stats.fragments_generated += len(raw_fragments)
+        stats.fragments_generated += len(candidate_cells)
 
-    for fragment in raw_fragments:
+    for cell in candidate_cells:
+        try:
+            fragment = zone.geometry.intersection(cell)
+        except Exception:
+            continue
+
         for poly in iter_polygons(safe_make_valid(fragment)):
             if poly.area <= 0:
                 continue
@@ -969,9 +1433,10 @@ def apply_mystery_pattern(
     min_fragment_ratio: float,
     max_fragments_per_zone: int,
 ) -> Tuple[List[ColorZone], Optional[object], MysterySplitStats]:
-    pattern_lines = pattern_data.boundary_lines
     stats = MysterySplitStats(zones_before=len(zones))
-    if pattern_lines is None or getattr(pattern_lines, "is_empty", False):
+    pattern_lines = pattern_data.boundary_lines
+    cell_tree = pattern_data.cell_tree
+    if pattern_lines is None or getattr(pattern_lines, "is_empty", False) or cell_tree is None:
         stats.zones_after = len(zones)
         return list(zones), None, stats
 
@@ -986,9 +1451,11 @@ def apply_mystery_pattern(
             continue
 
         stats.split_attempts += 1
-        parts = split_zone_by_pattern(
+        candidate_indices = cell_tree.query(zone.geometry, predicate="intersects")
+        candidate_cells = [pattern_data.cells[int(idx)] for idx in candidate_indices]
+        parts = fragment_zone_by_cells(
             zone=zone,
-            pattern_lines=pattern_lines,
+            candidate_cells=candidate_cells,
             min_fragment_area=min_fragment_area,
             min_fragment_ratio=min_fragment_ratio,
             max_fragments_per_zone=max_fragments_per_zone,
@@ -1186,11 +1653,12 @@ def interior_point_for_polygon(polygon: Polygon) -> Optional[Point]:
 def candidate_points_for_polygon(polygon: Polygon) -> List[Point]:
     points: List[Point] = []
     seen = set()
+    prepared_polygon = prep(polygon)
 
     def add_point(point: Optional[Point]) -> None:
         if point is None or point.is_empty:
             return
-        if not polygon.contains(point):
+        if not prepared_polygon.contains(point):
             return
         key = (round(point.x, 3), round(point.y, 3))
         if key in seen:
@@ -1252,26 +1720,89 @@ def label_box_in_svg(
     )
 
 
-def label_fits_inside_polygon(
-    polygon: Polygon,
-    target_geometry,
-    point: Point,
+def label_dimensions_in_svg(
     text_width_pdf: float,
     ascent_pdf: float,
     descent_pdf: float,
     scale: float,
+    padding_pdf: float,
+) -> Tuple[float, float]:
+    width_svg = (text_width_pdf + (2.0 * padding_pdf)) / max(scale, 1e-9)
+    height_pdf = (ascent_pdf - descent_pdf) + (2.0 * padding_pdf)
+    height_svg = height_pdf / max(scale, 1e-9)
+    return width_svg, height_svg
+
+
+def label_bounds_around_point(point: Point, width_svg: float, height_svg: float) -> Tuple[float, float, float, float]:
+    half_width = width_svg / 2.0
+    half_height = height_svg / 2.0
+    return (
+        point.x - half_width,
+        point.y - half_height,
+        point.x + half_width,
+        point.y + half_height,
+    )
+
+
+def bounds_can_contain_rect(
+    outer_bounds: Tuple[float, float, float, float],
+    rect_bounds: Tuple[float, float, float, float],
 ) -> bool:
-    if not polygon.contains(point):
+    outer_x0, outer_y0, outer_x1, outer_y1 = outer_bounds
+    rect_x0, rect_y0, rect_x1, rect_y1 = rect_bounds
+    return (
+        rect_x0 >= outer_x0
+        and rect_y0 >= outer_y0
+        and rect_x1 <= outer_x1
+        and rect_y1 <= outer_y1
+    )
+
+
+def size_fits_within_bounds(width_svg: float, height_svg: float, outer_bounds: Tuple[float, float, float, float]) -> bool:
+    outer_x0, outer_y0, outer_x1, outer_y1 = outer_bounds
+    outer_width = outer_x1 - outer_x0
+    outer_height = outer_y1 - outer_y0
+    return width_svg <= outer_width and height_svg <= outer_height
+
+
+def cap_font_size_by_bounds(
+    label: str,
+    requested_min_size: float,
+    requested_max_size: float,
+    bounds: Tuple[float, float, float, float],
+    scale: float,
+) -> Optional[float]:
+    size = requested_max_size
+    while size >= requested_min_size - 1e-9:
+        text_width_pdf, ascent_pdf, descent_pdf = label_pdf_metrics(label, size)
+        width_svg, height_svg = label_dimensions_in_svg(
+            text_width_pdf=text_width_pdf,
+            ascent_pdf=ascent_pdf,
+            descent_pdf=descent_pdf,
+            scale=scale,
+            padding_pdf=LABEL_PADDING_PDF,
+        )
+        if size_fits_within_bounds(width_svg, height_svg, bounds):
+            return size
+        size -= 0.5
+    return None
+
+
+def label_fits_inside_polygon(
+    target_geometry,
+    prepared_target_geometry,
+    point: Point,
+    width_svg: float,
+    height_svg: float,
+    target_bounds: Tuple[float, float, float, float],
+) -> bool:
+    rect_bounds = label_bounds_around_point(point, width_svg, height_svg)
+    if not bounds_can_contain_rect(target_bounds, rect_bounds):
         return False
 
-    label_rect = label_box_in_svg(
-        point=point,
-        text_width_pdf=text_width_pdf,
-        ascent_pdf=ascent_pdf,
-        descent_pdf=descent_pdf,
-        scale=scale,
-        padding_pdf=LABEL_PADDING_PDF,
-    )
+    label_rect = box(*rect_bounds)
+    if prepared_target_geometry is not None:
+        return bool(prepared_target_geometry.contains(label_rect))
     return bool(target_geometry.contains(label_rect))
 
 
@@ -1336,54 +1867,215 @@ def boxes_overlap(
 
 def collides_with_existing(
     box_pdf: Tuple[float, float, float, float],
-    occupied_boxes_pdf: Sequence[Tuple[float, float, float, float]],
+    collision_index: LabelCollisionIndex,
 ) -> bool:
-    for existing in occupied_boxes_pdf:
-        if boxes_overlap(box_pdf, existing, gap=LABEL_COLLISION_GAP_PDF):
-            return True
-    return False
+    return collision_index.collides(box_pdf)
 
 
 def label_placement(
     geometry: Polygon,
     label: str,
+    color_hex: str,
+    zone_index: int,
     scale: float,
     transform: LayoutTransform,
-    occupied_boxes_pdf: Sequence[Tuple[float, float, float, float]],
+    collision_index: LabelCollisionIndex,
     min_font_size: float,
     max_font_size: float,
+    diagnostics: Optional[LabelRenderDiagnostics] = None,
+    progress: Optional[CliProgressReporter] = None,
 ) -> Optional[LabelPlacement]:
+    zone_started_at = time.perf_counter()
+    zone_profile = LabelZoneProfile(
+        zone_index=zone_index,
+        color_hex=color_hex,
+        label=label,
+        area=float(getattr(geometry, "area", 0.0)),
+    )
+
+    def flush_progress_checks() -> None:
+        if progress is None:
+            return
+        pending_checks = (
+            (zone_profile.direct_candidate_checks % PROGRESS_CHECK_FLUSH_INTERVAL)
+            + (zone_profile.grid_candidate_checks % PROGRESS_CHECK_FLUSH_INTERVAL)
+        )
+        if pending_checks > 0:
+            progress.advance_detail(pending_checks)
+
     if geometry.is_empty:
+        zone_profile.result = "geometry-empty"
+        zone_profile.elapsed = time.perf_counter() - zone_started_at
+        if diagnostics is not None:
+            diagnostics.add_time("placement-total", zone_profile.elapsed)
+            diagnostics.inc("zones-geometry-empty")
+            diagnostics.add_zone_profile(zone_profile)
+        flush_progress_checks()
         return None
 
+    step_started_at = time.perf_counter()
     base_poly = pick_polygon_for_label(geometry)
+    pick_elapsed = time.perf_counter() - step_started_at
+    if diagnostics is not None:
+        diagnostics.add_time("pick-polygon", pick_elapsed)
     if base_poly is None:
+        zone_profile.result = "no-base-polygon"
+        zone_profile.elapsed = time.perf_counter() - zone_started_at
+        if diagnostics is not None:
+            diagnostics.add_time("placement-total", zone_profile.elapsed)
+            diagnostics.inc("zones-no-base-polygon")
+            diagnostics.add_zone_profile(zone_profile)
+        flush_progress_checks()
         return None
 
     requested_max = max(min_font_size, max_font_size)
     requested_min = min(min_font_size, max_font_size)
     max_size = min(6.0, max(2.0, requested_max))
     min_size = max(2.0, min(requested_min, max_size))
-    size = max_size
     step = 0.5
+
+    step_started_at = time.perf_counter()
     base_candidates = candidate_points_for_polygon(base_poly)
+    candidate_elapsed = time.perf_counter() - step_started_at
+    zone_profile.base_candidates = len(base_candidates)
+    if diagnostics is not None:
+        diagnostics.add_time("candidate-points", candidate_elapsed)
+        diagnostics.inc("base-candidates-total", len(base_candidates))
+
     containment_margin_svg = max(0.15 / max(scale, 1e-9), 1e-6)
+
+    step_started_at = time.perf_counter()
     inner_polygon = safe_make_valid(base_poly.buffer(-containment_margin_svg))
+    buffer_elapsed = time.perf_counter() - step_started_at
+    if diagnostics is not None:
+        diagnostics.add_time("inner-buffer", buffer_elapsed)
     placement_geometry = inner_polygon if not inner_polygon.is_empty else base_poly
+    placement_bounds = placement_geometry.bounds
+
+    step_started_at = time.perf_counter()
+    prepared_placement_geometry = prep(placement_geometry)
+    prepared_elapsed = time.perf_counter() - step_started_at
+    if diagnostics is not None:
+        diagnostics.add_time("prepare-placement-geometry", prepared_elapsed)
+
+    step_started_at = time.perf_counter()
+    grid_candidates: List[Tuple[Point, bool]] = []
+    min_x, min_y, max_x, max_y = base_poly.bounds
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    if span_x > 0 and span_y > 0:
+        grid_steps = 5
+        prepared_base_poly = prep(base_poly)
+        for gy in range(grid_steps):
+            y = min_y + (span_y * ((gy + 0.5) / grid_steps))
+            for gx in range(grid_steps):
+                x = min_x + (span_x * ((gx + 0.5) / grid_steps))
+                point = Point(x, y)
+                grid_candidates.append((point, prepared_base_poly.contains(point)))
+    precompute_grid_elapsed = time.perf_counter() - step_started_at
+    if diagnostics is not None:
+        diagnostics.add_time("precompute-grid", precompute_grid_elapsed)
+
+    fallback_point = center_point_for_fallback(base_poly)
+
+    step_started_at = time.perf_counter()
+    min_text_width_pdf, min_ascent_pdf, min_descent_pdf = label_pdf_metrics(label, min_size)
+    min_width_svg, min_height_svg = label_dimensions_in_svg(
+        text_width_pdf=min_text_width_pdf,
+        ascent_pdf=min_ascent_pdf,
+        descent_pdf=min_descent_pdf,
+        scale=scale,
+        padding_pdf=LABEL_PADDING_PDF,
+    )
+    bounded_max_size = cap_font_size_by_bounds(
+        label=label,
+        requested_min_size=min_size,
+        requested_max_size=max_size,
+        bounds=placement_bounds,
+        scale=scale,
+    )
+    bound_checks_elapsed = time.perf_counter() - step_started_at
+    if diagnostics is not None:
+        diagnostics.add_time("bounds-fit-pruning", bound_checks_elapsed)
+
+    if (
+        bounded_max_size is None
+        or not size_fits_within_bounds(min_width_svg, min_height_svg, placement_bounds)
+        or placement_geometry.area < (min_width_svg * min_height_svg)
+    ):
+        zone_profile.used_fallback = True
+        zone_profile.result = "fallback-impossible-fit"
+        zone_profile.elapsed = time.perf_counter() - zone_started_at
+        if diagnostics is not None:
+            diagnostics.inc("placements-impossible-fit")
+        fallback_size = min_size
+        text_width_pdf = min_text_width_pdf
+        ascent_pdf = min_ascent_pdf
+        descent_pdf = min_descent_pdf
+        x0, y0, x1, y1, center_x, center_y = label_box_in_pdf(
+            point=fallback_point,
+            text_width_pdf=text_width_pdf,
+            ascent_pdf=ascent_pdf,
+            descent_pdf=descent_pdf,
+            transform=transform,
+            padding_pdf=LABEL_PADDING_PDF,
+        )
+        if diagnostics is not None:
+            diagnostics.add_time("placement-total", zone_profile.elapsed)
+            diagnostics.add_zone_profile(zone_profile)
+        flush_progress_checks()
+        return LabelPlacement(
+            point=fallback_point,
+            font_size=fallback_size,
+            text_width_pdf=text_width_pdf,
+            ascent_pdf=ascent_pdf,
+            descent_pdf=descent_pdf,
+            center_pdf_x=center_x,
+            center_pdf_y=center_y,
+            box_pdf=(x0, y0, x1, y1),
+            used_fallback=True,
+        )
+
+    size = bounded_max_size
 
     while size >= min_size - 1e-9:
+        zone_profile.font_sizes_tried += 1
+        if diagnostics is not None:
+            diagnostics.inc("font-sizes-tried")
+
+        step_started_at = time.perf_counter()
         text_width_pdf, ascent_pdf, descent_pdf = label_pdf_metrics(label, size)
+        if diagnostics is not None:
+            diagnostics.add_time("font-metrics", time.perf_counter() - step_started_at)
+        width_svg, height_svg = label_dimensions_in_svg(
+            text_width_pdf=text_width_pdf,
+            ascent_pdf=ascent_pdf,
+            descent_pdf=descent_pdf,
+            scale=scale,
+            padding_pdf=LABEL_PADDING_PDF,
+        )
 
         for point in base_candidates:
+            zone_profile.direct_candidate_checks += 1
+            if diagnostics is not None:
+                diagnostics.inc("direct-candidate-checks")
+            if progress is not None and (zone_profile.direct_candidate_checks % PROGRESS_CHECK_FLUSH_INTERVAL) == 0:
+                progress.advance_detail(PROGRESS_CHECK_FLUSH_INTERVAL)
+
+            step_started_at = time.perf_counter()
             if label_fits_inside_polygon(
-                polygon=base_poly,
                 target_geometry=placement_geometry,
+                prepared_target_geometry=prepared_placement_geometry,
                 point=point,
-                text_width_pdf=text_width_pdf,
-                ascent_pdf=ascent_pdf,
-                descent_pdf=descent_pdf,
-                scale=scale,
+                width_svg=width_svg,
+                height_svg=height_svg,
+                target_bounds=placement_bounds,
             ):
+                if diagnostics is not None:
+                    diagnostics.add_time("fit-check-direct", time.perf_counter() - step_started_at)
+                    diagnostics.inc("fit-success-direct")
+
+                step_started_at = time.perf_counter()
                 x0, y0, x1, y1, center_x, center_y = label_box_in_pdf(
                     point=point,
                     text_width_pdf=text_width_pdf,
@@ -1392,9 +2084,26 @@ def label_placement(
                     transform=transform,
                     padding_pdf=LABEL_PADDING_PDF,
                 )
+                if diagnostics is not None:
+                    diagnostics.add_time("pdf-box-direct", time.perf_counter() - step_started_at)
                 box_pdf = (x0, y0, x1, y1)
-                if collides_with_existing(box_pdf, occupied_boxes_pdf):
+
+                step_started_at = time.perf_counter()
+                if collides_with_existing(box_pdf, collision_index):
+                    if diagnostics is not None:
+                        diagnostics.add_time("collision-check-direct", time.perf_counter() - step_started_at)
+                        diagnostics.inc("collision-rejects")
+                    zone_profile.collision_rejects += 1
                     continue
+                if diagnostics is not None:
+                    diagnostics.add_time("collision-check-direct", time.perf_counter() - step_started_at)
+                    diagnostics.add_time("placement-total", time.perf_counter() - zone_started_at)
+                    diagnostics.inc("placements-found")
+                zone_profile.result = "direct-success"
+                zone_profile.elapsed = time.perf_counter() - zone_started_at
+                if diagnostics is not None:
+                    diagnostics.add_zone_profile(zone_profile)
+                flush_progress_checks()
                 return LabelPlacement(
                     point=point,
                     font_size=size,
@@ -1406,56 +2115,85 @@ def label_placement(
                     box_pdf=box_pdf,
                     used_fallback=False,
                 )
+            elif diagnostics is not None:
+                diagnostics.add_time("fit-check-direct", time.perf_counter() - step_started_at)
 
-        min_x, min_y, max_x, max_y = base_poly.bounds
-        span_x = max_x - min_x
-        span_y = max_y - min_y
-        if span_x > 0 and span_y > 0:
-            grid_steps = 5
-            for gy in range(grid_steps):
-                y = min_y + (span_y * ((gy + 0.5) / grid_steps))
-                for gx in range(grid_steps):
-                    x = min_x + (span_x * ((gx + 0.5) / grid_steps))
-                    point = Point(x, y)
-                    if not base_poly.contains(point):
-                        continue
-                    if label_fits_inside_polygon(
-                        polygon=base_poly,
-                        target_geometry=placement_geometry,
+        if grid_candidates:
+            zone_profile.used_grid = True
+            for point, point_is_inside in grid_candidates:
+                if diagnostics is not None:
+                    diagnostics.inc("grid-candidate-checks")
+                zone_profile.grid_candidate_checks += 1
+                if progress is not None and (zone_profile.grid_candidate_checks % PROGRESS_CHECK_FLUSH_INTERVAL) == 0:
+                    progress.advance_detail(PROGRESS_CHECK_FLUSH_INTERVAL)
+
+                if not point_is_inside:
+                    if diagnostics is not None:
+                        diagnostics.inc("grid-point-outside")
+                    continue
+
+                step_started_at = time.perf_counter()
+                if label_fits_inside_polygon(
+                    target_geometry=placement_geometry,
+                    prepared_target_geometry=prepared_placement_geometry,
+                    point=point,
+                    width_svg=width_svg,
+                    height_svg=height_svg,
+                    target_bounds=placement_bounds,
+                ):
+                    if diagnostics is not None:
+                        diagnostics.add_time("fit-check-grid", time.perf_counter() - step_started_at)
+                        diagnostics.inc("fit-success-grid")
+
+                    step_started_at = time.perf_counter()
+                    x0, y0, x1, y1, center_x, center_y = label_box_in_pdf(
                         point=point,
                         text_width_pdf=text_width_pdf,
                         ascent_pdf=ascent_pdf,
                         descent_pdf=descent_pdf,
-                        scale=scale,
-                    ):
-                        x0, y0, x1, y1, center_x, center_y = label_box_in_pdf(
-                            point=point,
-                            text_width_pdf=text_width_pdf,
-                            ascent_pdf=ascent_pdf,
-                            descent_pdf=descent_pdf,
-                            transform=transform,
-                            padding_pdf=LABEL_PADDING_PDF,
-                        )
-                        box_pdf = (x0, y0, x1, y1)
-                        if collides_with_existing(box_pdf, occupied_boxes_pdf):
-                            continue
-                        return LabelPlacement(
-                            point=point,
-                            font_size=size,
-                            text_width_pdf=text_width_pdf,
-                            ascent_pdf=ascent_pdf,
-                            descent_pdf=descent_pdf,
-                            center_pdf_x=center_x,
-                            center_pdf_y=center_y,
-                            box_pdf=box_pdf,
-                            used_fallback=False,
-                        )
+                        transform=transform,
+                        padding_pdf=LABEL_PADDING_PDF,
+                    )
+                    if diagnostics is not None:
+                        diagnostics.add_time("pdf-box-grid", time.perf_counter() - step_started_at)
+                    box_pdf = (x0, y0, x1, y1)
+
+                    step_started_at = time.perf_counter()
+                    if collides_with_existing(box_pdf, collision_index):
+                        if diagnostics is not None:
+                            diagnostics.add_time("collision-check-grid", time.perf_counter() - step_started_at)
+                            diagnostics.inc("collision-rejects")
+                        zone_profile.collision_rejects += 1
+                        continue
+                    if diagnostics is not None:
+                        diagnostics.add_time("collision-check-grid", time.perf_counter() - step_started_at)
+                        diagnostics.add_time("placement-total", time.perf_counter() - zone_started_at)
+                        diagnostics.inc("placements-found")
+                    zone_profile.result = "grid-success"
+                    zone_profile.elapsed = time.perf_counter() - zone_started_at
+                    if diagnostics is not None:
+                        diagnostics.add_zone_profile(zone_profile)
+                    flush_progress_checks()
+                    return LabelPlacement(
+                        point=point,
+                        font_size=size,
+                        text_width_pdf=text_width_pdf,
+                        ascent_pdf=ascent_pdf,
+                        descent_pdf=descent_pdf,
+                        center_pdf_x=center_x,
+                        center_pdf_y=center_y,
+                        box_pdf=box_pdf,
+                        used_fallback=False,
+                    )
+                elif diagnostics is not None:
+                    diagnostics.add_time("fit-check-grid", time.perf_counter() - step_started_at)
 
         size -= step
 
     # Mandatory fallback: place centered at minimum size even if outside bounds.
     fallback_size = min_size
-    fallback_point = center_point_for_fallback(base_poly)
+
+    step_started_at = time.perf_counter()
     text_width_pdf, ascent_pdf, descent_pdf = label_pdf_metrics(label, fallback_size)
     x0, y0, x1, y1, center_x, center_y = label_box_in_pdf(
         point=fallback_point,
@@ -1465,6 +2203,16 @@ def label_placement(
         transform=transform,
         padding_pdf=LABEL_PADDING_PDF,
     )
+    fallback_elapsed = time.perf_counter() - step_started_at
+    zone_profile.used_fallback = True
+    zone_profile.result = "fallback"
+    zone_profile.elapsed = time.perf_counter() - zone_started_at
+    if diagnostics is not None:
+        diagnostics.add_time("fallback-placement", fallback_elapsed)
+        diagnostics.add_time("placement-total", zone_profile.elapsed)
+        diagnostics.inc("placements-fallback")
+        diagnostics.add_zone_profile(zone_profile)
+    flush_progress_checks()
     return LabelPlacement(
         point=fallback_point,
         font_size=fallback_size,
@@ -1486,36 +2234,64 @@ def draw_labels(
     min_font_size: float,
     max_font_size: float,
     number_gray: float,
+    diagnostics: Optional[LabelRenderDiagnostics] = None,
+    progress: Optional[CliProgressReporter] = None,
 ) -> Tuple[int, int]:
+    started_at = time.perf_counter()
     placed = 0
     skipped = 0
-    occupied_boxes_pdf: List[Tuple[float, float, float, float]] = []
+    collision_index = LabelCollisionIndex()
 
+    if diagnostics is not None:
+        diagnostics.inc("zones-total", len(zones))
+
+    sort_started_at = time.perf_counter()
     ordered_zones = sorted(zones, key=lambda z: z.geometry.area)
+    if diagnostics is not None:
+        diagnostics.add_time("sort-zones", time.perf_counter() - sort_started_at)
 
-    for zone in ordered_zones:
+    for zone_index, zone in enumerate(ordered_zones):
+        if diagnostics is not None:
+            diagnostics.inc("zones-processed")
         label = color_to_label.get(zone.color_hex)
         if label is None:
+            if diagnostics is not None:
+                diagnostics.inc("zones-without-label")
+            if progress is not None:
+                progress.advance_items(1)
             continue
         placement = label_placement(
             geometry=zone.geometry,
             label=label,
+            color_hex=zone.color_hex,
+            zone_index=zone_index,
             scale=transform.scale,
             transform=transform,
-            occupied_boxes_pdf=occupied_boxes_pdf,
+            collision_index=collision_index,
             min_font_size=min_font_size,
             max_font_size=max_font_size,
+            diagnostics=diagnostics,
+            progress=progress,
         )
         if placement is None:
             skipped += 1
+            if diagnostics is not None:
+                diagnostics.inc("placements-none")
+            if progress is not None:
+                progress.advance_items(1)
             continue
 
         if zone.color_hex == EXCLUDED_COLOR_HEX and placement.used_fallback:
             skipped += 1
+            if diagnostics is not None:
+                diagnostics.inc("black-fallback-skipped")
+            if progress is not None:
+                progress.advance_items(1)
             continue
 
         baseline_y = placement.center_pdf_y - ((placement.ascent_pdf + placement.descent_pdf) / 2.0)
 
+        draw_started_at = time.perf_counter()
         pdf.setFillGray(number_gray)
         pdf.setFont(FONT_NAME, placement.font_size)
         pdf.drawString(
@@ -1523,9 +2299,20 @@ def draw_labels(
             baseline_y,
             label,
         )
-        occupied_boxes_pdf.append(placement.box_pdf)
-        placed += 1
+        if diagnostics is not None:
+            diagnostics.add_time("draw-text", time.perf_counter() - draw_started_at)
 
+        index_started_at = time.perf_counter()
+        collision_index.add(placement.box_pdf)
+        if diagnostics is not None:
+            diagnostics.add_time("collision-index-add", time.perf_counter() - index_started_at)
+            diagnostics.inc("labels-drawn")
+        placed += 1
+        if progress is not None:
+            progress.advance_items(1)
+
+    if diagnostics is not None:
+        diagnostics.add_time("render-labels-total", time.perf_counter() - started_at)
     return placed, skipped
 
 
@@ -1642,6 +2429,9 @@ def render_pdf(
     mystery_boundary_gray: float = DEFAULT_MYSTERY_BOUNDARY_GRAY,
     mystery_boundary_width: float = DEFAULT_MYSTERY_BOUNDARY_WIDTH,
     args: Optional[argparse.Namespace] = None,
+    diagnostics: Optional[StageDiagnostics] = None,
+    label_diagnostics: Optional[LabelRenderDiagnostics] = None,
+    progress: Optional[CliProgressReporter] = None,
 ) -> Tuple[int, int]:
     page_width, page_height = A4
     legend_height = compute_legend_height(len(palette))
@@ -1654,6 +2444,8 @@ def render_pdf(
     pdf.rect(0, 0, page_width, page_height, stroke=0, fill=1)
 
     stage_started_at = time.perf_counter()
+    if progress is not None:
+        progress.start_step("render-outline", total_items=len(shapes), unit_label="formas")
     for shape in shapes:
         draw_black_outline(
             pdf,
@@ -1662,9 +2454,18 @@ def render_pdf(
             line_width=line_width,
             outline_gray=outline_gray,
         )
-    log_stage_timing("render-outline", time.perf_counter() - stage_started_at, args, shapes=len(shapes))
+        if progress is not None:
+            progress.advance_items(1)
+    elapsed = time.perf_counter() - stage_started_at
+    if diagnostics is not None:
+        diagnostics.record("render-outline", elapsed, shapes=len(shapes))
+    if progress is not None:
+        progress.complete_step("render-outline", elapsed)
+    log_stage_timing("render-outline", elapsed, args, shapes=len(shapes))
 
     stage_started_at = time.perf_counter()
+    if progress is not None:
+        progress.start_step("render-mystery-boundaries")
     draw_line_geometry(
         pdf,
         geometry=mystery_boundaries,
@@ -1672,9 +2473,21 @@ def render_pdf(
         line_width=mystery_boundary_width,
         stroke_gray=mystery_boundary_gray,
     )
-    log_stage_timing("render-mystery-boundaries", time.perf_counter() - stage_started_at, args)
+    elapsed = time.perf_counter() - stage_started_at
+    if diagnostics is not None:
+        diagnostics.record("render-mystery-boundaries", elapsed)
+    if progress is not None:
+        progress.complete_step("render-mystery-boundaries", elapsed)
+    log_stage_timing("render-mystery-boundaries", elapsed, args)
 
     stage_started_at = time.perf_counter()
+    if progress is not None:
+        progress.start_step(
+            "render-labels",
+            total_items=len(zones),
+            unit_label="zonas",
+            detail_label="checks",
+        )
     placed, skipped = draw_labels(
         pdf,
         zones=zones,
@@ -1683,10 +2496,23 @@ def render_pdf(
         min_font_size=min_font_size,
         max_font_size=max_font_size,
         number_gray=number_gray,
+        diagnostics=label_diagnostics,
+        progress=progress,
     )
+    elapsed = time.perf_counter() - stage_started_at
+    if diagnostics is not None:
+        diagnostics.record(
+            "render-labels",
+            elapsed,
+            zones=len(zones),
+            labels_placed=placed,
+            labels_skipped=skipped,
+        )
+    if progress is not None:
+        progress.complete_step("render-labels", elapsed)
     log_stage_timing(
         "render-labels",
-        time.perf_counter() - stage_started_at,
+        elapsed,
         args,
         zones=len(zones),
         labels_placed=placed,
@@ -1694,6 +2520,8 @@ def render_pdf(
     )
 
     stage_started_at = time.perf_counter()
+    if progress is not None:
+        progress.start_step("render-legend")
     draw_legend(
         pdf,
         palette=palette,
@@ -1702,28 +2530,49 @@ def render_pdf(
         legend_height=legend_height,
         show_hex=show_hex,
     )
-    log_stage_timing("render-legend", time.perf_counter() - stage_started_at, args, colors=len(palette))
+    elapsed = time.perf_counter() - stage_started_at
+    if diagnostics is not None:
+        diagnostics.record("render-legend", elapsed, colors=len(palette))
+    if progress is not None:
+        progress.complete_step("render-legend", elapsed)
+    log_stage_timing("render-legend", elapsed, args, colors=len(palette))
 
     stage_started_at = time.perf_counter()
+    if progress is not None:
+        progress.start_step("render-save")
     pdf.showPage()
     pdf.save()
-    log_stage_timing("render-save", time.perf_counter() - stage_started_at, args)
+    elapsed = time.perf_counter() - stage_started_at
+    if diagnostics is not None:
+        diagnostics.record("render-save", elapsed)
+    if progress is not None:
+        progress.complete_step("render-save", elapsed)
+    log_stage_timing("render-save", elapsed, args)
     return placed, skipped
 
 
-def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple[int, int, int]:
+def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> ConvertResult:
     diagnostics = StageDiagnostics()
+    label_diagnostics = LabelRenderDiagnostics() if getattr(args, "test", False) else None
+    progress = CliProgressReporter(
+        steps=build_progress_steps(args),
+        started_at=getattr(args, "command_started_at", time.perf_counter()),
+        stage_estimates=load_stage_estimates_from_logs(output_pdf),
+    )
 
     log_step(f"Leyendo SVG base: {svg_path.name}", args)
     stage_started_at = time.perf_counter()
+    progress.start_step("read-svg")
     shapes, view_box = read_svg(svg_path)
     elapsed = time.perf_counter() - stage_started_at
-    diagnostics.record("read-svg", elapsed)
+    diagnostics.record("read-svg", elapsed, shapes=len(shapes))
+    progress.complete_step("read-svg", elapsed)
     log_stage_timing("read-svg", elapsed, args, shapes=len(shapes))
     mystery_boundaries = None
 
     log_step("Extrayendo zonas coloreables", args)
     stage_started_at = time.perf_counter()
+    progress.start_step("build-zones")
     zones = build_zones(
         shapes,
         include_strokes=args.include_strokes,
@@ -1731,21 +2580,26 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple
         min_area=args.min_area,
     )
     elapsed = time.perf_counter() - stage_started_at
-    diagnostics.record("build-zones", elapsed)
+    diagnostics.record("build-zones", elapsed, zones=len(zones), max_step=args.max_segment_step)
+    progress.complete_step("build-zones", elapsed)
     log_stage_timing("build-zones", elapsed, args, zones=len(zones), max_step=args.max_segment_step)
     log_step(f"Zonas iniciales detectadas: {len(zones)}", args)
 
     log_step("Normalizando color mas cercano al negro puro", args)
     stage_started_at = time.perf_counter()
+    progress.start_step("normalize-black", total_items=len(zones), unit_label="zonas")
     zones = normalize_nearest_black(zones)
     elapsed = time.perf_counter() - stage_started_at
-    diagnostics.record("normalize-black", elapsed)
+    diagnostics.record("normalize-black", elapsed, zones=len(zones))
+    progress.advance_items(len(zones))
+    progress.complete_step("normalize-black", elapsed)
     log_stage_timing("normalize-black", elapsed, args, zones=len(zones))
 
     if args.mystery_pattern:
         mystery_max_step = args.mystery_max_segment_step
         log_step(f"Cargando patron mystery: {Path(args.mystery_pattern).name}", args)
         stage_started_at = time.perf_counter()
+        progress.start_step("load-mystery-pattern")
         pattern_data = load_mystery_pattern(
             pattern_svg=Path(args.mystery_pattern).expanduser().resolve(),
             target_view_box=view_box,
@@ -1753,7 +2607,13 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple
             fit_mode=args.mystery_fit,
         )
         elapsed = time.perf_counter() - stage_started_at
-        diagnostics.record("load-mystery-pattern", elapsed)
+        diagnostics.record(
+            "load-mystery-pattern",
+            elapsed,
+            cells=len(pattern_data.cells),
+            max_step=mystery_max_step,
+        )
+        progress.complete_step("load-mystery-pattern", elapsed)
         log_stage_timing(
             "load-mystery-pattern",
             elapsed,
@@ -1764,6 +2624,7 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple
         log_step(f"Patron preparado con {len(pattern_data.cells)} celdas", args)
         log_step("Fragmentando zonas con el patron", args)
         stage_started_at = time.perf_counter()
+        progress.start_step("apply-mystery-pattern", total_items=len(zones), unit_label="zonas")
         zones, mystery_boundaries, mystery_stats = apply_mystery_pattern(
             zones=zones,
             pattern_data=pattern_data,
@@ -1772,7 +2633,23 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple
             max_fragments_per_zone=args.mystery_max_fragments_per_zone,
         )
         elapsed = time.perf_counter() - stage_started_at
-        diagnostics.record("apply-mystery-pattern", elapsed)
+        diagnostics.record(
+            "apply-mystery-pattern",
+            elapsed,
+            zones_before=mystery_stats.zones_before,
+            zones_after=mystery_stats.zones_after,
+            split_attempts=mystery_stats.split_attempts,
+            bbox_skips=mystery_stats.bbox_skips,
+            fragments_generated=mystery_stats.fragments_generated,
+            fragments_kept=mystery_stats.fragments_kept,
+            zones_split=mystery_stats.zones_split,
+            rejected_small=mystery_stats.rejected_small,
+            rejected_ratio=mystery_stats.rejected_ratio,
+            unsplit_too_few=mystery_stats.zones_unsplit_too_few,
+            unsplit_over_limit=mystery_stats.zones_unsplit_over_limit,
+        )
+        progress.advance_items(mystery_stats.zones_before)
+        progress.complete_step("apply-mystery-pattern", elapsed)
         log_stage_timing(
             "apply-mystery-pattern",
             elapsed,
@@ -1798,13 +2675,16 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple
 
     log_step("Construyendo paleta y referencias", args)
     stage_started_at = time.perf_counter()
+    progress.start_step("build-palette", total_items=len(zones), unit_label="zonas")
     palette = sorted({zone.color_hex for zone in zones}, key=color_sort_key)
     if not palette:
         raise SvgToPdfError("La paleta numerable quedo vacia.")
 
     color_to_label = build_color_labels(palette)
     elapsed = time.perf_counter() - stage_started_at
-    diagnostics.record("build-palette", elapsed)
+    diagnostics.record("build-palette", elapsed, colors=len(palette))
+    progress.advance_items(len(zones))
+    progress.complete_step("build-palette", elapsed)
     log_stage_timing("build-palette", elapsed, args, colors=len(palette))
 
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -1827,17 +2707,35 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Tuple
         mystery_boundary_gray=args.mystery_boundary_gray,
         mystery_boundary_width=args.mystery_boundary_width,
         args=args,
+        diagnostics=diagnostics,
+        label_diagnostics=label_diagnostics,
+        progress=progress,
     )
     elapsed = time.perf_counter() - stage_started_at
     diagnostics.record("render-pdf-total", elapsed)
     log_stage_timing("render-pdf-total", elapsed, args)
 
-    total_stages = sum(stage_elapsed for _, stage_elapsed in diagnostics.timings)
+    total_stages = profiled_total_elapsed(diagnostics)
     log_stage_timing("convert-total-profiled", total_stages, args)
 
     log_step("PDF terminado", args)
 
-    return len(palette), placed, skipped
+    result = ConvertResult(
+        palette_count=len(palette),
+        labels_placed=placed,
+        labels_skipped=skipped,
+        stage_diagnostics=diagnostics,
+        label_diagnostics=label_diagnostics,
+    )
+    if getattr(args, "test", False):
+        result.log_file_path = write_test_log(
+            input_svg=svg_path,
+            output_pdf=output_pdf,
+            result=result,
+            args=args,
+        )
+
+    return result
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1875,6 +2773,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--show-hex",
         action="store_true",
         help="Muestra tambien el codigo HEX en la leyenda.",
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help=(
+            "Genera un log detallado de profiling junto al PDF con nombre "
+            "{filename}_log_{timestamp}.txt."
+        ),
     )
     parser.add_argument(
         "--mystery-pattern",
@@ -2006,7 +2912,7 @@ def run_single_file(input_svg: Path, args: argparse.Namespace) -> int:
     log_step(f"Salida prevista: {output_pdf}", args)
 
     try:
-        palette_count, labels_placed, labels_skipped = convert(input_svg, output_pdf, args)
+        result = convert(input_svg, output_pdf, args)
     except SvgToPdfError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -2016,9 +2922,11 @@ def run_single_file(input_svg: Path, args: argparse.Namespace) -> int:
 
     total_elapsed = format_elapsed(time.perf_counter() - args.command_started_at)
     print(f"OK: PDF generado en {output_pdf}")
-    print(f"- Colores numerables: {palette_count}")
-    print(f"- Numeros colocados: {labels_placed}")
-    print(f"- Zonas omitidas por falta de espacio: {labels_skipped}")
+    print(f"- Colores numerables: {result.palette_count}")
+    print(f"- Numeros colocados: {result.labels_placed}")
+    print(f"- Zonas omitidas por falta de espacio: {result.labels_skipped}")
+    if result.log_file_path is not None:
+        print(f"- Log de test: {result.log_file_path}")
     print(f"- Tiempo total: {total_elapsed}")
     return 0
 
@@ -2058,12 +2966,14 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
         file_started_at = time.perf_counter()
         log_step(f"Procesando archivo batch: {svg_file.name}", args)
         try:
-            palette_count, labels_placed, labels_skipped = convert(svg_file, output_pdf, args)
+            result = convert(svg_file, output_pdf, args)
             print(
                 f"[OK] {svg_file.name} -> {output_pdf.name} | "
-                f"colores: {palette_count}, colocados: {labels_placed}, omitidos: {labels_skipped}, "
+                f"colores: {result.palette_count}, colocados: {result.labels_placed}, omitidos: {result.labels_skipped}, "
                 f"tiempo: {format_elapsed(time.perf_counter() - file_started_at)}"
             )
+            if result.log_file_path is not None:
+                print(f"      log: {result.log_file_path.name}")
             ok_count += 1
         except SvgToPdfError as exc:
             print(f"[ERROR] {svg_file.name}: {exc}", file=sys.stderr)
