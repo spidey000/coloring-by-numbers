@@ -60,6 +60,8 @@ Durante la ejecucion, el CLI muestra un checklist de etapas con `[x]`, `[>]` y `
 
 En `render-labels`, ademas muestra progreso en vivo por zonas y un contador aproximado de `checks` geometricos para que se vea cuanto falta cuando el trabajo interno es grande.
 
+En modo carpeta, tambien muestra progreso batch por archivo (`completados/total`), archivo actual y ETA global restante del lote.
+
 ## Opciones CLI principales
 
 - `--include-strokes`: incluye trazos sin relleno como zonas numerables (usa buffer geometrico por `stroke-width`).

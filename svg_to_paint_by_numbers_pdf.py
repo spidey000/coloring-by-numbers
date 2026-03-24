@@ -563,6 +563,28 @@ def build_progress_steps(args: argparse.Namespace) -> List[ProgressStep]:
     return steps
 
 
+def log_batch_progress(
+    *,
+    batch_started_at: float,
+    files_total: int,
+    files_completed: int,
+    current_file: Optional[str] = None,
+    current_file_index: Optional[int] = None,
+) -> None:
+    elapsed = time.perf_counter() - batch_started_at
+    summary = [f"archivos: {files_completed}/{files_total}"]
+    if files_total > 0:
+        summary.append(f"{(files_completed / files_total) * 100.0:0.1f}%")
+    if current_file is not None and current_file_index is not None:
+        summary.append(f"actual: {current_file_index}/{files_total} {current_file}")
+    summary.append(f"transcurrido: {format_elapsed(elapsed)}")
+    if files_completed > 0 and files_total > files_completed:
+        avg_per_file = elapsed / files_completed
+        eta = avg_per_file * (files_total - files_completed)
+        summary.append(f"ETA batch: {format_elapsed(eta)}")
+    print(f"[paint-numbers][batch] {' | '.join(summary)}")
+
+
 def make_test_log_path(output_pdf: Path) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return output_pdf.with_name(f"{output_pdf.stem}_log_{stamp}.txt")
@@ -2956,14 +2978,30 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
 
     ok_count = 0
     fail_count = 0
+    batch_started_at = time.perf_counter()
 
     log_step(f"Iniciando modo batch en {input_dir}", args)
     print(f"Batch: {len(svg_files)} SVG(s) detectados en {input_dir}")
     print(f"Batch: salida en {batch_output_dir}")
+    log_batch_progress(
+        batch_started_at=batch_started_at,
+        files_total=len(svg_files),
+        files_completed=0,
+        current_file=svg_files[0].name if svg_files else None,
+        current_file_index=1 if svg_files else None,
+    )
 
-    for svg_file in svg_files:
+    for file_index, svg_file in enumerate(svg_files, start=1):
         output_pdf = batch_output_dir / f"{svg_file.stem}.pdf"
         file_started_at = time.perf_counter()
+        completed_before_current = ok_count + fail_count
+        log_batch_progress(
+            batch_started_at=batch_started_at,
+            files_total=len(svg_files),
+            files_completed=completed_before_current,
+            current_file=svg_file.name,
+            current_file_index=file_index,
+        )
         log_step(f"Procesando archivo batch: {svg_file.name}", args)
         try:
             result = convert(svg_file, output_pdf, args)
@@ -2975,12 +3013,27 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
             if result.log_file_path is not None:
                 print(f"      log: {result.log_file_path.name}")
             ok_count += 1
+            log_batch_progress(
+                batch_started_at=batch_started_at,
+                files_total=len(svg_files),
+                files_completed=ok_count + fail_count,
+            )
         except SvgToPdfError as exc:
             print(f"[ERROR] {svg_file.name}: {exc}", file=sys.stderr)
             fail_count += 1
+            log_batch_progress(
+                batch_started_at=batch_started_at,
+                files_total=len(svg_files),
+                files_completed=ok_count + fail_count,
+            )
         except Exception as exc:  # pragma: no cover - defensive final fallback
             print(f"[ERROR] {svg_file.name}: error inesperado: {exc}", file=sys.stderr)
             fail_count += 1
+            log_batch_progress(
+                batch_started_at=batch_started_at,
+                files_total=len(svg_files),
+                files_completed=ok_count + fail_count,
+            )
 
     print("Batch finalizado")
     print(f"- SVG totales: {len(svg_files)}")
