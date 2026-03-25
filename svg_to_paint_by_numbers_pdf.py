@@ -89,6 +89,13 @@ CLI_SCRIPT_NAME = Path(__file__).name
 CLI_HELP_COMMAND = f"python {CLI_SCRIPT_NAME} --help"
 
 
+class CleanHelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter,
+    argparse.RawDescriptionHelpFormatter,
+):
+    pass
+
+
 class SvgToPdfError(Exception):
     """Domain error for conversion failures."""
 
@@ -2871,48 +2878,54 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Conve
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawTextHelpFormatter,
+        formatter_class=CleanHelpFormatter,
         description=(
-            "Convierte un SVG vectorial (o una carpeta con SVGs) en PDF(s) A4 "
+            "Convierte un SVG vectorial o una carpeta con SVGs en PDF(s) A4 "
             "con formato de colorear por numeros."
         ),
         epilog=build_help_epilog(),
     )
     parser.add_argument(
         "input_path",
+        metavar="INPUT_PATH",
         help=(
-            "Ruta de entrada. Si es archivo .svg genera un PDF; si es carpeta procesa "
-            "todos los .svg en modo batch."
+            "Ruta de entrada. Si es archivo `.svg` genera un PDF; si es carpeta "
+            "procesa todos los `.svg` en modo batch."
         ),
     )
-    parser.add_argument(
+
+    output_group = parser.add_argument_group("salida")
+    output_group.add_argument(
         "-o",
         "--output",
+        metavar="PDF",
         help=(
-            "Ruta del PDF de salida (solo modo archivo). "
-            "Por defecto: output/<entrada>_paint_by_numbers.pdf. Ejemplo: --output salida.pdf"
+            "Ruta del PDF de salida para modo archivo. "
+            "Si se omite, usa `output/<entrada>_paint_by_numbers.pdf`."
         ),
     )
-    parser.add_argument(
+    output_group.add_argument(
         "--font-path",
         default=str(DEFAULT_FONT_PATH),
+        metavar="TTF",
         help=(
             "Ruta al archivo TTF de Montserrat. Cambialo solo si la fuente no esta en "
             "fonts/Montserrat-Regular.ttf."
         ),
     )
-    parser.add_argument(
+
+    render_group = parser.add_argument_group("renderizado")
+    render_group.add_argument(
         "--include-strokes",
         action="store_true",
         help=(
-            "Incluye trazos sin relleno como zonas numerables; util para SVGs con lineas "
-            "sin `fill`."
+            "Incluye trazos sin relleno como zonas numerables usando un buffer por `stroke-width`."
         ),
     )
-    parser.add_argument(
+    render_group.add_argument(
         "--show-hex",
         action="store_true",
-        help="Muestra tambien el codigo HEX en la leyenda.",
+        help="Muestra tambien el codigo HEX en la leyenda de colores.",
     )
     parser.add_argument(
         "--test",
@@ -2973,7 +2986,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Usa un valor mas alto para reducir CPU en la fragmentacion."
         ),
     )
-    parser.add_argument(
+    render_group.add_argument(
         "--representation-grey",
         "--representation-gray",
         dest="representation_grey",
@@ -2981,33 +2994,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         metavar=("OUTLINE_GREY", "NUMBER_GREY"),
         help=(
-            "Override de tonos grises para representacion del dibujo principal: "
-            "primero contorno, luego numeros (rango 0..1). Ejemplo: --representation-grey 0.70 0.40"
+            "Sobrescribe los tonos grises del dibujo principal: primero contorno, "
+            "luego numeros (rango 0..1)."
         ),
     )
-    parser.add_argument(
+    render_group.add_argument(
         "--min-font-size",
         type=float,
         default=2.0,
-        help="Tamano minimo de fuente para numeros (pt, minimo efectivo 2).",
+        metavar="PT",
+        help="Tamano minimo de fuente para numeros en puntos.",
     )
-    parser.add_argument(
+    render_group.add_argument(
         "--max-font-size",
         type=float,
         default=6.0,
-        help="Tamano maximo de fuente para numeros (pt, maximo efectivo 6).",
+        metavar="PT",
+        help="Tamano maximo de fuente para numeros en puntos.",
     )
-    parser.add_argument(
+    render_group.add_argument(
         "--line-width",
         type=float,
         default=0.55,
-        help="Grosor de linea del dibujo principal (pt).",
+        metavar="PT",
+        help="Grosor de linea del dibujo principal en puntos.",
     )
-    parser.add_argument(
+
+    geometry_group = parser.add_argument_group("geometria")
+    geometry_group.add_argument(
         "--max-segment-step",
         type=float,
         default=2.2,
-        help="Paso maximo de muestreo para arcos/curvas; valores mayores aceleran y reducen detalle.",
+        metavar="SVG_UNITS",
+        help="Paso maximo de muestreo para arcos y curvas en la geometria interna.",
+    )
+    geometry_group.add_argument(
+        "--min-area",
+        type=float,
+        default=0.0,
+        metavar="SVG_UNITS2",
+        help="Area minima de zona para etiquetado; `0` incluye todas.",
     )
     parser.add_argument(
         "--batch-workers",
@@ -3016,12 +3042,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Cantidad de procesos para modo carpeta. Por defecto se activa automaticamente "
             "cuando hay mas de un SVG; usa 1 para forzar modo serial."
         ),
-    )
-    parser.add_argument(
-        "--min-area",
-        type=float,
-        default=0.0,
-        help="Area minima SVG^2 para etiquetado; util para ignorar microzonas. 0 incluye todas.",
     )
     return parser
 
