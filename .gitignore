@@ -8,3 +8,6 @@ venv/
 *_paint_by_numbers.pdf
 output/
 pdf-output-*/
+
+# Secrets
+.env
