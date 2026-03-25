@@ -19,9 +19,11 @@ import argparse
 import colorsys
 import functools
 import math
+import os
 import re
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,6 +85,8 @@ DEFAULT_MYSTERY_BOUNDARY_GRAY = 0.74
 DEFAULT_MYSTERY_BOUNDARY_WIDTH = 0.35
 PROGRESS_RENDER_INTERVAL = 0.8
 PROGRESS_CHECK_FLUSH_INTERVAL = 250
+CLI_SCRIPT_NAME = Path(__file__).name
+CLI_HELP_COMMAND = f"python {CLI_SCRIPT_NAME} --help"
 
 
 class SvgToPdfError(Exception):
@@ -101,12 +105,43 @@ def format_elapsed(seconds: float) -> str:
 
 
 def log_step(message: str, args: Optional[argparse.Namespace] = None) -> None:
+    if args is not None and getattr(args, "quiet_worker_output", False):
+        return
     prefix = "[paint-numbers]"
     if args is not None and hasattr(args, "command_started_at"):
         elapsed = format_elapsed(time.perf_counter() - args.command_started_at)
         print(f"{prefix} +{elapsed} {message}")
         return
     print(f"{prefix} {message}")
+
+
+def cli_help_hint() -> str:
+    return f"Consulta `{CLI_HELP_COMMAND}` para ver todos los comandos y ejemplos."
+
+
+def cli_input_examples() -> str:
+    return (
+        f"Archivo: python {CLI_SCRIPT_NAME} dibujo.svg | "
+        f"Carpeta batch: python {CLI_SCRIPT_NAME} inputs"
+    )
+
+
+def build_help_epilog() -> str:
+    return (
+        "Ejemplos:\n"
+        f"  python {CLI_SCRIPT_NAME} dibujo.svg\n"
+        f"  python {CLI_SCRIPT_NAME} dibujo.svg --output salida.pdf\n"
+        f"  python {CLI_SCRIPT_NAME} inputs\n"
+        f"  python {CLI_SCRIPT_NAME} inputs --batch-workers 1\n"
+        f"  python {CLI_SCRIPT_NAME} dibujo.svg --include-strokes\n"
+        f"  python {CLI_SCRIPT_NAME} dibujo.svg --representation-grey 0.70 0.40\n"
+        f"  python {CLI_SCRIPT_NAME} dibujo.svg --mystery-pattern patterns/pattern.svg --mystery-fit contain\n"
+        "\n"
+        "Notas:\n"
+        "  - Si `input_path` es archivo, genera un solo PDF.\n"
+        "  - Si `input_path` es carpeta, procesa todos los `.svg` y activa paralelismo automatico si hay mas de uno.\n"
+        "  - Usa `--batch-workers 1` para forzar modo serial."
+    )
 
 
 @dataclass
@@ -134,24 +169,55 @@ class LayoutTransform:
 
     svg_min_x: float
     svg_min_y: float
+    svg_width: float
     svg_height: float
     scale: float
     draw_x: float
     draw_y: float
     offset_x: float
     offset_y: float
+    scaled_width: float
     scaled_height: float
+    rotate_clockwise: bool = False
+
+    def effective_svg_dimensions(self) -> Tuple[float, float]:
+        if self.rotate_clockwise:
+            return self.svg_height, self.svg_width
+        return self.svg_width, self.svg_height
+
+    def label_dimensions_in_svg(
+        self,
+        text_width_pdf: float,
+        ascent_pdf: float,
+        descent_pdf: float,
+        padding_pdf: float,
+    ) -> Tuple[float, float]:
+        width_svg = (text_width_pdf + (2.0 * padding_pdf)) / max(self.scale, 1e-9)
+        height_pdf = (ascent_pdf - descent_pdf) + (2.0 * padding_pdf)
+        height_svg = height_pdf / max(self.scale, 1e-9)
+        if self.rotate_clockwise:
+            return height_svg, width_svg
+        return width_svg, height_svg
 
     def map_xy(self, x: float, y: float) -> Tuple[float, float]:
-        px = self.draw_x + self.offset_x + (x - self.svg_min_x) * self.scale
-        local_y = (y - self.svg_min_y) * self.scale
-        py = self.draw_y + self.offset_y + (self.scaled_height - local_y)
+        local_x = x - self.svg_min_x
+        local_y = y - self.svg_min_y
+        if self.rotate_clockwise:
+            mapped_x = self.svg_height - local_y
+            mapped_y = local_x
+        else:
+            mapped_x = local_x
+            mapped_y = local_y
+
+        px = self.draw_x + self.offset_x + (mapped_x * self.scale)
+        local_y_pdf = mapped_y * self.scale
+        py = self.draw_y + self.offset_y + (self.scaled_height - local_y_pdf)
         return px, py
 
 
 @dataclass
 class LabelPlacement:
-    """Resolved label placement guaranteed to fit its region."""
+    """Resolved label placement for a zone label."""
 
     point: Point
     font_size: float
@@ -162,6 +228,7 @@ class LabelPlacement:
     center_pdf_y: float
     box_pdf: Tuple[float, float, float, float]
     used_fallback: bool
+    fits_inside_region: bool
 
 
 @dataclass
@@ -226,10 +293,12 @@ class CliProgressReporter:
         steps: Sequence[ProgressStep],
         started_at: float,
         stage_estimates: Optional[Dict[str, float]] = None,
+        enabled: bool = True,
     ) -> None:
         self.steps = list(steps)
         self.started_at = started_at
         self.stage_estimates = dict(stage_estimates or {})
+        self.enabled = enabled
         self.step_index = {step.key: index for index, step in enumerate(self.steps)}
         self.completed_keys = set()
         self.active: Optional[ActiveProgress] = None
@@ -275,6 +344,8 @@ class CliProgressReporter:
         self.render(force=True)
 
     def render(self, force: bool = False) -> None:
+        if not self.enabled:
+            return
         now = time.perf_counter()
         if not force and self.active is not None and self.active.total_items:
             percent = int((self.active.completed_items * 100) / max(self.active.total_items, 1))
@@ -436,6 +507,19 @@ class ConvertResult:
 
 
 @dataclass
+class BatchJobResult:
+    svg_name: str
+    output_pdf_name: str
+    elapsed_text: str
+    ok: bool
+    palette_count: int = 0
+    labels_placed: int = 0
+    labels_skipped: int = 0
+    log_file_name: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+@dataclass
 class LabelCollisionIndex:
     """Spatial hash for placed label boxes in PDF coordinates."""
 
@@ -586,8 +670,13 @@ def log_batch_progress(
 
 
 def make_test_log_path(output_pdf: Path) -> Path:
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return output_pdf.with_name(f"{output_pdf.stem}_log_{stamp}.txt")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    log_path = output_pdf.with_name(f"{output_pdf.stem}_log_{stamp}.txt")
+    suffix = 1
+    while log_path.exists():
+        log_path = output_pdf.with_name(f"{output_pdf.stem}_log_{stamp}-{suffix:02d}.txt")
+        suffix += 1
+    return log_path
 
 
 def build_test_log_text(
@@ -755,13 +844,17 @@ def register_montserrat_font(font_path: Path) -> None:
     if not font_path.exists():
         raise SvgToPdfError(
             f"No se encontro la fuente requerida en {font_path}. "
-            "Descarga Montserrat-Regular.ttf y colocala en fonts/."
+            "Descarga Montserrat-Regular.ttf y colocala en fonts/, o usa --font-path <ruta_ttf>. "
+            f"{cli_help_hint()}"
         )
 
     try:
         pdfmetrics.registerFont(TTFont(FONT_NAME, str(font_path)))
     except Exception as exc:
-        raise SvgToPdfError(f"No se pudo registrar la fuente Montserrat: {exc}") from exc
+        raise SvgToPdfError(
+            f"No se pudo registrar la fuente Montserrat: {exc}. Verifica que el archivo sea un TTF valido "
+            f"o indica otra ruta con --font-path. {cli_help_hint()}"
+        ) from exc
 
 
 def merge_style(parent: Dict[str, str], elem: ET.Element) -> Dict[str, str]:
@@ -1226,15 +1319,23 @@ def read_svg(svg_path: Path) -> Tuple[List[SvgShape], Tuple[float, float, float,
     try:
         tree = ET.parse(svg_path)
     except ET.ParseError as exc:
-        raise SvgToPdfError(f"No se pudo parsear el SVG: {exc}") from exc
+        raise SvgToPdfError(
+            f"No se pudo parsear el SVG: {exc}. Verifica que el archivo sea un SVG XML valido y vuelve a exportarlo si hace falta. "
+            f"{cli_help_hint()}"
+        ) from exc
 
     root = tree.getroot()
     if local_name(root.tag) != "svg":
-        raise SvgToPdfError("El archivo no contiene una raiz <svg> valida.")
+        raise SvgToPdfError(
+            f"El archivo no contiene una raiz <svg> valida. Asegurate de usar un SVG real exportado desde tu editor. {cli_help_hint()}"
+        )
 
     shapes = collect_svg_shapes(root)
     if not shapes:
-        raise SvgToPdfError("No se encontraron elementos vectoriales compatibles.")
+        raise SvgToPdfError(
+            "No se encontraron elementos vectoriales compatibles. Usa formas SVG con fill o prueba --include-strokes si tu arte usa lineas. "
+            f"{cli_help_hint()}"
+        )
 
     view_box = parse_view_box(root)
     if view_box is None:
@@ -1245,7 +1346,10 @@ def read_svg(svg_path: Path) -> Tuple[List[SvgShape], Tuple[float, float, float,
         else:
             bbox = compute_paths_bbox(shapes)
             if bbox is None:
-                raise SvgToPdfError("No fue posible determinar el area del dibujo SVG.")
+                raise SvgToPdfError(
+                    "No fue posible determinar el area del dibujo SVG. Revisa que el archivo tenga viewBox, width/height o geometria valida. "
+                    f"{cli_help_hint()}"
+                )
             view_box = bbox
 
     return shapes, view_box
@@ -1268,7 +1372,7 @@ def build_color_labels(palette: Sequence[str]) -> Dict[str, str]:
     if len(palette) > len(REFERENCE_SYMBOLS):
         raise SvgToPdfError(
             "Hay mas colores que referencias de un solo caracter disponibles "
-            f"({len(palette)} > {len(REFERENCE_SYMBOLS)})."
+            f"({len(palette)} > {len(REFERENCE_SYMBOLS)}). Reduce la cantidad de colores en el SVG antes de ejecutar el comando."
         )
     return {color_hex: REFERENCE_SYMBOLS[idx] for idx, color_hex in enumerate(palette)}
 
@@ -1390,7 +1494,10 @@ def load_mystery_pattern(
                     cells.append(out_poly)
 
     if not cells:
-        raise SvgToPdfError("El pattern SVG no produjo celdas geometrizadas utilizables.")
+        raise SvgToPdfError(
+            "El pattern SVG no produjo celdas geometrizadas utilizables. Verifica que el patron tenga formas rellenables o ajusta las opciones mystery. "
+            f"{cli_help_hint()}"
+        )
 
     boundary_lines = unary_union([cell.boundary for cell in cells])
     cell_tree = STRtree(cells)
@@ -1509,25 +1616,33 @@ def build_layout(
     draw_w = page_width - (2.0 * margin)
     draw_h = page_height - draw_y - margin
     if draw_w <= 0 or draw_h <= 0:
-        raise SvgToPdfError("No hay espacio util para maquetar el dibujo en A4.")
+        raise SvgToPdfError(
+            "No hay espacio util para maquetar el dibujo en A4. Prueba bajar --line-width, ajustar fuentes o simplificar el SVG. "
+            f"{cli_help_hint()}"
+        )
 
     svg_min_x, svg_min_y, svg_w, svg_h = view_box
-    scale = min(draw_w / svg_w, draw_h / svg_h)
-    scaled_w = svg_w * scale
-    scaled_h = svg_h * scale
+    rotate_clockwise = svg_w > svg_h
+    effective_w, effective_h = (svg_h, svg_w) if rotate_clockwise else (svg_w, svg_h)
+    scale = min(draw_w / effective_w, draw_h / effective_h)
+    scaled_w = effective_w * scale
+    scaled_h = effective_h * scale
     offset_x = (draw_w - scaled_w) / 2.0
     offset_y = (draw_h - scaled_h) / 2.0
 
     return LayoutTransform(
         svg_min_x=svg_min_x,
         svg_min_y=svg_min_y,
+        svg_width=svg_w,
         svg_height=svg_h,
         scale=scale,
         draw_x=draw_x,
         draw_y=draw_y,
         offset_x=offset_x,
         offset_y=offset_y,
+        scaled_width=scaled_w,
         scaled_height=scaled_h,
+        rotate_clockwise=rotate_clockwise,
     )
 
 
@@ -1699,8 +1814,8 @@ def candidate_points_for_polygon(polygon: Polygon) -> List[Point]:
     add_point(center)
 
     # First try two horizontal bands to reduce label collisions.
-    y_bands = (0.40, 0.62, 0.50, 0.28, 0.74)
-    x_positions = (0.20, 0.35, 0.50, 0.65, 0.80)
+    y_bands = (0.22, 0.34, 0.40, 0.50, 0.62, 0.74, 0.86)
+    x_positions = (0.14, 0.26, 0.38, 0.50, 0.62, 0.74, 0.86)
     span_x = max_x - min_x
     span_y = max_y - min_y
     if span_x > 0 and span_y > 0:
@@ -1708,6 +1823,15 @@ def candidate_points_for_polygon(polygon: Polygon) -> List[Point]:
             for fx in x_positions:
                 candidate = Point(min_x + (span_x * fx), min_y + (span_y * fy))
                 add_point(candidate)
+
+        quarter_points = (
+            Point(min_x + (span_x * 0.25), min_y + (span_y * 0.25)),
+            Point(min_x + (span_x * 0.75), min_y + (span_y * 0.25)),
+            Point(min_x + (span_x * 0.25), min_y + (span_y * 0.75)),
+            Point(min_x + (span_x * 0.75), min_y + (span_y * 0.75)),
+        )
+        for point in quarter_points:
+            add_point(point)
 
     return points
 
@@ -1726,12 +1850,15 @@ def label_box_in_svg(
     text_width_pdf: float,
     ascent_pdf: float,
     descent_pdf: float,
-    scale: float,
+    transform: LayoutTransform,
     padding_pdf: float,
 ) -> Polygon:
-    width_svg = (text_width_pdf + (2.0 * padding_pdf)) / max(scale, 1e-9)
-    height_pdf = (ascent_pdf - descent_pdf) + (2.0 * padding_pdf)
-    height_svg = height_pdf / max(scale, 1e-9)
+    width_svg, height_svg = transform.label_dimensions_in_svg(
+        text_width_pdf=text_width_pdf,
+        ascent_pdf=ascent_pdf,
+        descent_pdf=descent_pdf,
+        padding_pdf=padding_pdf,
+    )
     half_width = width_svg / 2.0
     half_height = height_svg / 2.0
     return box(
@@ -1746,13 +1873,15 @@ def label_dimensions_in_svg(
     text_width_pdf: float,
     ascent_pdf: float,
     descent_pdf: float,
-    scale: float,
+    transform: LayoutTransform,
     padding_pdf: float,
 ) -> Tuple[float, float]:
-    width_svg = (text_width_pdf + (2.0 * padding_pdf)) / max(scale, 1e-9)
-    height_pdf = (ascent_pdf - descent_pdf) + (2.0 * padding_pdf)
-    height_svg = height_pdf / max(scale, 1e-9)
-    return width_svg, height_svg
+    return transform.label_dimensions_in_svg(
+        text_width_pdf=text_width_pdf,
+        ascent_pdf=ascent_pdf,
+        descent_pdf=descent_pdf,
+        padding_pdf=padding_pdf,
+    )
 
 
 def label_bounds_around_point(point: Point, width_svg: float, height_svg: float) -> Tuple[float, float, float, float]:
@@ -1792,7 +1921,7 @@ def cap_font_size_by_bounds(
     requested_min_size: float,
     requested_max_size: float,
     bounds: Tuple[float, float, float, float],
-    scale: float,
+    transform: LayoutTransform,
 ) -> Optional[float]:
     size = requested_max_size
     while size >= requested_min_size - 1e-9:
@@ -1801,7 +1930,7 @@ def cap_font_size_by_bounds(
             text_width_pdf=text_width_pdf,
             ascent_pdf=ascent_pdf,
             descent_pdf=descent_pdf,
-            scale=scale,
+            transform=transform,
             padding_pdf=LABEL_PADDING_PDF,
         )
         if size_fits_within_bounds(width_svg, height_svg, bounds):
@@ -1899,7 +2028,6 @@ def label_placement(
     label: str,
     color_hex: str,
     zone_index: int,
-    scale: float,
     transform: LayoutTransform,
     collision_index: LabelCollisionIndex,
     min_font_size: float,
@@ -1950,11 +2078,8 @@ def label_placement(
         flush_progress_checks()
         return None
 
-    requested_max = max(min_font_size, max_font_size)
-    requested_min = min(min_font_size, max_font_size)
-    max_size = min(6.0, max(2.0, requested_max))
-    min_size = max(2.0, min(requested_min, max_size))
-    step = 0.5
+    fixed_size = 3.0
+    scale = transform.scale
 
     step_started_at = time.perf_counter()
     base_candidates = candidate_points_for_polygon(base_poly)
@@ -2001,39 +2126,28 @@ def label_placement(
     fallback_point = center_point_for_fallback(base_poly)
 
     step_started_at = time.perf_counter()
-    min_text_width_pdf, min_ascent_pdf, min_descent_pdf = label_pdf_metrics(label, min_size)
-    min_width_svg, min_height_svg = label_dimensions_in_svg(
-        text_width_pdf=min_text_width_pdf,
-        ascent_pdf=min_ascent_pdf,
-        descent_pdf=min_descent_pdf,
-        scale=scale,
+    text_width_pdf, ascent_pdf, descent_pdf = label_pdf_metrics(label, fixed_size)
+    width_svg, height_svg = label_dimensions_in_svg(
+        text_width_pdf=text_width_pdf,
+        ascent_pdf=ascent_pdf,
+        descent_pdf=descent_pdf,
+        transform=transform,
         padding_pdf=LABEL_PADDING_PDF,
-    )
-    bounded_max_size = cap_font_size_by_bounds(
-        label=label,
-        requested_min_size=min_size,
-        requested_max_size=max_size,
-        bounds=placement_bounds,
-        scale=scale,
     )
     bound_checks_elapsed = time.perf_counter() - step_started_at
     if diagnostics is not None:
         diagnostics.add_time("bounds-fit-pruning", bound_checks_elapsed)
 
     if (
-        bounded_max_size is None
-        or not size_fits_within_bounds(min_width_svg, min_height_svg, placement_bounds)
-        or placement_geometry.area < (min_width_svg * min_height_svg)
+        not size_fits_within_bounds(width_svg, height_svg, placement_bounds)
+        or placement_geometry.area < (width_svg * height_svg)
     ):
         zone_profile.used_fallback = True
-        zone_profile.result = "fallback-impossible-fit"
+        zone_profile.result = "center-overflow-impossible-fit"
         zone_profile.elapsed = time.perf_counter() - zone_started_at
         if diagnostics is not None:
-            diagnostics.inc("placements-impossible-fit")
-        fallback_size = min_size
-        text_width_pdf = min_text_width_pdf
-        ascent_pdf = min_ascent_pdf
-        descent_pdf = min_descent_pdf
+            diagnostics.inc("placements-center-overflow-impossible-fit")
+        fallback_size = fixed_size
         x0, y0, x1, y1, center_x, center_y = label_box_in_pdf(
             point=fallback_point,
             text_width_pdf=text_width_pdf,
@@ -2056,33 +2170,95 @@ def label_placement(
             center_pdf_y=center_y,
             box_pdf=(x0, y0, x1, y1),
             used_fallback=True,
+            fits_inside_region=False,
         )
 
-    size = bounded_max_size
+    zone_profile.font_sizes_tried += 1
+    if diagnostics is not None:
+        diagnostics.inc("font-sizes-tried")
 
-    while size >= min_size - 1e-9:
-        zone_profile.font_sizes_tried += 1
+    step_started_at = time.perf_counter()
+    _, _, _ = label_pdf_metrics(label, fixed_size)
+    if diagnostics is not None:
+        diagnostics.add_time("font-metrics", time.perf_counter() - step_started_at)
+
+    for point in base_candidates:
+        zone_profile.direct_candidate_checks += 1
         if diagnostics is not None:
-            diagnostics.inc("font-sizes-tried")
+            diagnostics.inc("direct-candidate-checks")
+        if progress is not None and (zone_profile.direct_candidate_checks % PROGRESS_CHECK_FLUSH_INTERVAL) == 0:
+            progress.advance_detail(PROGRESS_CHECK_FLUSH_INTERVAL)
 
         step_started_at = time.perf_counter()
-        text_width_pdf, ascent_pdf, descent_pdf = label_pdf_metrics(label, size)
-        if diagnostics is not None:
-            diagnostics.add_time("font-metrics", time.perf_counter() - step_started_at)
-        width_svg, height_svg = label_dimensions_in_svg(
-            text_width_pdf=text_width_pdf,
-            ascent_pdf=ascent_pdf,
-            descent_pdf=descent_pdf,
-            scale=scale,
-            padding_pdf=LABEL_PADDING_PDF,
-        )
-
-        for point in base_candidates:
-            zone_profile.direct_candidate_checks += 1
+        if label_fits_inside_polygon(
+            target_geometry=placement_geometry,
+            prepared_target_geometry=prepared_placement_geometry,
+            point=point,
+            width_svg=width_svg,
+            height_svg=height_svg,
+            target_bounds=placement_bounds,
+        ):
             if diagnostics is not None:
-                diagnostics.inc("direct-candidate-checks")
-            if progress is not None and (zone_profile.direct_candidate_checks % PROGRESS_CHECK_FLUSH_INTERVAL) == 0:
+                diagnostics.add_time("fit-check-direct", time.perf_counter() - step_started_at)
+                diagnostics.inc("fit-success-direct")
+
+            step_started_at = time.perf_counter()
+            x0, y0, x1, y1, center_x, center_y = label_box_in_pdf(
+                point=point,
+                text_width_pdf=text_width_pdf,
+                ascent_pdf=ascent_pdf,
+                descent_pdf=descent_pdf,
+                transform=transform,
+                padding_pdf=LABEL_PADDING_PDF,
+            )
+            if diagnostics is not None:
+                diagnostics.add_time("pdf-box-direct", time.perf_counter() - step_started_at)
+            box_pdf = (x0, y0, x1, y1)
+
+            step_started_at = time.perf_counter()
+            if collides_with_existing(box_pdf, collision_index):
+                if diagnostics is not None:
+                    diagnostics.add_time("collision-check-direct", time.perf_counter() - step_started_at)
+                    diagnostics.inc("collision-rejects")
+                zone_profile.collision_rejects += 1
+                continue
+            if diagnostics is not None:
+                diagnostics.add_time("collision-check-direct", time.perf_counter() - step_started_at)
+                diagnostics.add_time("placement-total", time.perf_counter() - zone_started_at)
+                diagnostics.inc("placements-found")
+            zone_profile.result = "direct-success"
+            zone_profile.elapsed = time.perf_counter() - zone_started_at
+            if diagnostics is not None:
+                diagnostics.add_zone_profile(zone_profile)
+            flush_progress_checks()
+            return LabelPlacement(
+                point=point,
+                font_size=fixed_size,
+                text_width_pdf=text_width_pdf,
+                ascent_pdf=ascent_pdf,
+                descent_pdf=descent_pdf,
+                center_pdf_x=center_x,
+                center_pdf_y=center_y,
+                box_pdf=box_pdf,
+                used_fallback=False,
+                fits_inside_region=True,
+            )
+        elif diagnostics is not None:
+            diagnostics.add_time("fit-check-direct", time.perf_counter() - step_started_at)
+
+    if grid_candidates:
+        zone_profile.used_grid = True
+        for point, point_is_inside in grid_candidates:
+            if diagnostics is not None:
+                diagnostics.inc("grid-candidate-checks")
+            zone_profile.grid_candidate_checks += 1
+            if progress is not None and (zone_profile.grid_candidate_checks % PROGRESS_CHECK_FLUSH_INTERVAL) == 0:
                 progress.advance_detail(PROGRESS_CHECK_FLUSH_INTERVAL)
+
+            if not point_is_inside:
+                if diagnostics is not None:
+                    diagnostics.inc("grid-point-outside")
+                continue
 
             step_started_at = time.perf_counter()
             if label_fits_inside_polygon(
@@ -2094,8 +2270,8 @@ def label_placement(
                 target_bounds=placement_bounds,
             ):
                 if diagnostics is not None:
-                    diagnostics.add_time("fit-check-direct", time.perf_counter() - step_started_at)
-                    diagnostics.inc("fit-success-direct")
+                    diagnostics.add_time("fit-check-grid", time.perf_counter() - step_started_at)
+                    diagnostics.inc("fit-success-grid")
 
                 step_started_at = time.perf_counter()
                 x0, y0, x1, y1, center_x, center_y = label_box_in_pdf(
@@ -2107,28 +2283,28 @@ def label_placement(
                     padding_pdf=LABEL_PADDING_PDF,
                 )
                 if diagnostics is not None:
-                    diagnostics.add_time("pdf-box-direct", time.perf_counter() - step_started_at)
+                    diagnostics.add_time("pdf-box-grid", time.perf_counter() - step_started_at)
                 box_pdf = (x0, y0, x1, y1)
 
                 step_started_at = time.perf_counter()
                 if collides_with_existing(box_pdf, collision_index):
                     if diagnostics is not None:
-                        diagnostics.add_time("collision-check-direct", time.perf_counter() - step_started_at)
+                        diagnostics.add_time("collision-check-grid", time.perf_counter() - step_started_at)
                         diagnostics.inc("collision-rejects")
                     zone_profile.collision_rejects += 1
                     continue
                 if diagnostics is not None:
-                    diagnostics.add_time("collision-check-direct", time.perf_counter() - step_started_at)
+                    diagnostics.add_time("collision-check-grid", time.perf_counter() - step_started_at)
                     diagnostics.add_time("placement-total", time.perf_counter() - zone_started_at)
                     diagnostics.inc("placements-found")
-                zone_profile.result = "direct-success"
+                zone_profile.result = "grid-success"
                 zone_profile.elapsed = time.perf_counter() - zone_started_at
                 if diagnostics is not None:
                     diagnostics.add_zone_profile(zone_profile)
                 flush_progress_checks()
                 return LabelPlacement(
                     point=point,
-                    font_size=size,
+                    font_size=fixed_size,
                     text_width_pdf=text_width_pdf,
                     ascent_pdf=ascent_pdf,
                     descent_pdf=descent_pdf,
@@ -2136,84 +2312,13 @@ def label_placement(
                     center_pdf_y=center_y,
                     box_pdf=box_pdf,
                     used_fallback=False,
+                    fits_inside_region=True,
                 )
             elif diagnostics is not None:
-                diagnostics.add_time("fit-check-direct", time.perf_counter() - step_started_at)
+                diagnostics.add_time("fit-check-grid", time.perf_counter() - step_started_at)
 
-        if grid_candidates:
-            zone_profile.used_grid = True
-            for point, point_is_inside in grid_candidates:
-                if diagnostics is not None:
-                    diagnostics.inc("grid-candidate-checks")
-                zone_profile.grid_candidate_checks += 1
-                if progress is not None and (zone_profile.grid_candidate_checks % PROGRESS_CHECK_FLUSH_INTERVAL) == 0:
-                    progress.advance_detail(PROGRESS_CHECK_FLUSH_INTERVAL)
-
-                if not point_is_inside:
-                    if diagnostics is not None:
-                        diagnostics.inc("grid-point-outside")
-                    continue
-
-                step_started_at = time.perf_counter()
-                if label_fits_inside_polygon(
-                    target_geometry=placement_geometry,
-                    prepared_target_geometry=prepared_placement_geometry,
-                    point=point,
-                    width_svg=width_svg,
-                    height_svg=height_svg,
-                    target_bounds=placement_bounds,
-                ):
-                    if diagnostics is not None:
-                        diagnostics.add_time("fit-check-grid", time.perf_counter() - step_started_at)
-                        diagnostics.inc("fit-success-grid")
-
-                    step_started_at = time.perf_counter()
-                    x0, y0, x1, y1, center_x, center_y = label_box_in_pdf(
-                        point=point,
-                        text_width_pdf=text_width_pdf,
-                        ascent_pdf=ascent_pdf,
-                        descent_pdf=descent_pdf,
-                        transform=transform,
-                        padding_pdf=LABEL_PADDING_PDF,
-                    )
-                    if diagnostics is not None:
-                        diagnostics.add_time("pdf-box-grid", time.perf_counter() - step_started_at)
-                    box_pdf = (x0, y0, x1, y1)
-
-                    step_started_at = time.perf_counter()
-                    if collides_with_existing(box_pdf, collision_index):
-                        if diagnostics is not None:
-                            diagnostics.add_time("collision-check-grid", time.perf_counter() - step_started_at)
-                            diagnostics.inc("collision-rejects")
-                        zone_profile.collision_rejects += 1
-                        continue
-                    if diagnostics is not None:
-                        diagnostics.add_time("collision-check-grid", time.perf_counter() - step_started_at)
-                        diagnostics.add_time("placement-total", time.perf_counter() - zone_started_at)
-                        diagnostics.inc("placements-found")
-                    zone_profile.result = "grid-success"
-                    zone_profile.elapsed = time.perf_counter() - zone_started_at
-                    if diagnostics is not None:
-                        diagnostics.add_zone_profile(zone_profile)
-                    flush_progress_checks()
-                    return LabelPlacement(
-                        point=point,
-                        font_size=size,
-                        text_width_pdf=text_width_pdf,
-                        ascent_pdf=ascent_pdf,
-                        descent_pdf=descent_pdf,
-                        center_pdf_x=center_x,
-                        center_pdf_y=center_y,
-                        box_pdf=box_pdf,
-                        used_fallback=False,
-                    )
-                elif diagnostics is not None:
-                    diagnostics.add_time("fit-check-grid", time.perf_counter() - step_started_at)
-
-        size -= step
-
-    # Mandatory fallback: place centered at minimum size even if outside bounds.
-    fallback_size = min_size
+    # Final fallback for non-fitting zones: keep the label centered on its own zone.
+    fallback_size = fixed_size
 
     step_started_at = time.perf_counter()
     text_width_pdf, ascent_pdf, descent_pdf = label_pdf_metrics(label, fallback_size)
@@ -2227,12 +2332,12 @@ def label_placement(
     )
     fallback_elapsed = time.perf_counter() - step_started_at
     zone_profile.used_fallback = True
-    zone_profile.result = "fallback"
+    zone_profile.result = "center-overflow"
     zone_profile.elapsed = time.perf_counter() - zone_started_at
     if diagnostics is not None:
         diagnostics.add_time("fallback-placement", fallback_elapsed)
         diagnostics.add_time("placement-total", zone_profile.elapsed)
-        diagnostics.inc("placements-fallback")
+        diagnostics.inc("placements-center-overflow")
         diagnostics.add_zone_profile(zone_profile)
     flush_progress_checks()
     return LabelPlacement(
@@ -2245,6 +2350,7 @@ def label_placement(
         center_pdf_y=center_y,
         box_pdf=(x0, y0, x1, y1),
         used_fallback=True,
+        fits_inside_region=False,
     )
 
 
@@ -2287,7 +2393,6 @@ def draw_labels(
             label=label,
             color_hex=zone.color_hex,
             zone_index=zone_index,
-            scale=transform.scale,
             transform=transform,
             collision_index=collision_index,
             min_font_size=min_font_size,
@@ -2303,10 +2408,10 @@ def draw_labels(
                 progress.advance_items(1)
             continue
 
-        if zone.color_hex == EXCLUDED_COLOR_HEX and placement.used_fallback:
+        if zone.color_hex == EXCLUDED_COLOR_HEX and not placement.fits_inside_region:
             skipped += 1
             if diagnostics is not None:
-                diagnostics.inc("black-fallback-skipped")
+                diagnostics.inc("black-overflow-skipped")
             if progress is not None:
                 progress.advance_items(1)
             continue
@@ -2580,6 +2685,7 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Conve
         steps=build_progress_steps(args),
         started_at=getattr(args, "command_started_at", time.perf_counter()),
         stage_estimates=load_stage_estimates_from_logs(output_pdf),
+        enabled=not getattr(args, "quiet_worker_output", False),
     )
 
     log_step(f"Leyendo SVG base: {svg_path.name}", args)
@@ -2692,7 +2798,8 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Conve
 
     if not zones:
         raise SvgToPdfError(
-            "No se detectaron zonas rellenables en el SVG."
+            "No se detectaron zonas rellenables en el SVG. Usa formas con fill o prueba --include-strokes si el dibujo usa solo trazos. "
+            f"{cli_help_hint()}"
         )
 
     log_step("Construyendo paleta y referencias", args)
@@ -2700,7 +2807,9 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Conve
     progress.start_step("build-palette", total_items=len(zones), unit_label="zonas")
     palette = sorted({zone.color_hex for zone in zones}, key=color_sort_key)
     if not palette:
-        raise SvgToPdfError("La paleta numerable quedo vacia.")
+        raise SvgToPdfError(
+            f"La paleta numerable quedo vacia. Revisa que el SVG tenga colores rellenables validos. {cli_help_hint()}"
+        )
 
     color_to_label = build_color_labels(palette)
     elapsed = time.perf_counter() - stage_started_at
@@ -2762,33 +2871,42 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Conve
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
         description=(
             "Convierte un SVG vectorial (o una carpeta con SVGs) en PDF(s) A4 "
             "con formato de colorear por numeros."
-        )
+        ),
+        epilog=build_help_epilog(),
     )
     parser.add_argument(
         "input_path",
-        help="Ruta de un archivo .svg o de una carpeta con archivos .svg.",
+        help=(
+            "Ruta de entrada. Si es archivo .svg genera un PDF; si es carpeta procesa "
+            "todos los .svg en modo batch."
+        ),
     )
     parser.add_argument(
         "-o",
         "--output",
         help=(
             "Ruta del PDF de salida (solo modo archivo). "
-            "Por defecto: output/<entrada>_paint_by_numbers.pdf"
+            "Por defecto: output/<entrada>_paint_by_numbers.pdf. Ejemplo: --output salida.pdf"
         ),
     )
     parser.add_argument(
         "--font-path",
         default=str(DEFAULT_FONT_PATH),
-        help="Ruta del archivo TTF de Montserrat.",
+        help=(
+            "Ruta al archivo TTF de Montserrat. Cambialo solo si la fuente no esta en "
+            "fonts/Montserrat-Regular.ttf."
+        ),
     )
     parser.add_argument(
         "--include-strokes",
         action="store_true",
         help=(
-            "Incluye trazos sin relleno como zonas numerables (buffer geometrico por stroke-width)."
+            "Incluye trazos sin relleno como zonas numerables; util para SVGs con lineas "
+            "sin `fill`."
         ),
     )
     parser.add_argument(
@@ -2801,30 +2919,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Genera un log detallado de profiling junto al PDF con nombre "
-            "{filename}_log_{timestamp}.txt."
+            "{filename}_log_{timestamp}.txt; en batch crea un log por cada PDF."
         ),
     )
     parser.add_argument(
         "--mystery-pattern",
-        help="Ruta a un SVG patron para fragmentar geometricamente todo el dibujo.",
+        help="Ruta a un archivo SVG patron para fragmentar geometricamente todo el dibujo.",
     )
     parser.add_argument(
         "--mystery-fit",
         choices=("contain", "cover", "stretch"),
         default="cover",
-        help="Modo de ajuste del patron sobre el viewBox del dibujo.",
+        help="Modo de ajuste del patron sobre el viewBox: contain, cover o stretch.",
     )
     parser.add_argument(
         "--mystery-min-fragment-area",
         type=float,
         default=12.0,
-        help="Area minima para conservar un fragmento generado por el patron.",
+        help="Area minima SVG^2 para conservar un fragmento del patron; subelo para descartar piezas muy pequenas.",
     )
     parser.add_argument(
         "--mystery-min-fragment-ratio",
         type=float,
         default=0.015,
-        help="Proporcion minima respecto al area de la zona original para conservar un fragmento.",
+        help="Proporcion minima respecto a la zona original; subela para evitar fragmentos diminutos.",
     )
     parser.add_argument(
         "--mystery-max-fragments-per-zone",
@@ -2838,7 +2956,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="mystery_boundary_gray",
         type=float,
         default=DEFAULT_MYSTERY_BOUNDARY_GRAY,
-        help="Tono gris para las divisiones internas del patron (0..1).",
+        help="Tono gris para las divisiones internas del patron (0..1). Ejemplo: 0.85.",
     )
     parser.add_argument(
         "--mystery-boundary-width",
@@ -2864,7 +2982,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar=("OUTLINE_GREY", "NUMBER_GREY"),
         help=(
             "Override de tonos grises para representacion del dibujo principal: "
-            "primero contorno, luego numeros (rango 0..1)."
+            "primero contorno, luego numeros (rango 0..1). Ejemplo: --representation-grey 0.70 0.40"
         ),
     )
     parser.add_argument(
@@ -2889,13 +3007,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-segment-step",
         type=float,
         default=2.2,
-        help="Paso maximo de muestreo para arcos/curvas durante la geometria interna.",
+        help="Paso maximo de muestreo para arcos/curvas; valores mayores aceleran y reducen detalle.",
+    )
+    parser.add_argument(
+        "--batch-workers",
+        type=int,
+        help=(
+            "Cantidad de procesos para modo carpeta. Por defecto se activa automaticamente "
+            "cuando hay mas de un SVG; usa 1 para forzar modo serial."
+        ),
     )
     parser.add_argument(
         "--min-area",
         type=float,
         default=0.0,
-        help="Area minima de zona (unidades SVG^2) para etiquetado (0 incluye todas).",
+        help="Area minima SVG^2 para etiquetado; util para ignorar microzonas. 0 incluye todas.",
     )
     return parser
 
@@ -2909,6 +3035,66 @@ def resolve_single_output_path(input_svg: Path, explicit_output: Optional[str]) 
 def collect_svg_inputs(input_dir: Path) -> List[Path]:
     svg_files = [item for item in input_dir.iterdir() if item.is_file() and item.suffix.lower() == ".svg"]
     return sorted(svg_files, key=lambda p: p.name.lower())
+
+
+def resolve_batch_worker_count(requested_workers: Optional[int], svg_count: int) -> int:
+    if requested_workers is not None:
+        if requested_workers < 1:
+            raise SvgToPdfError(
+                f"--batch-workers debe ser 1 o mayor. Ejemplo: --batch-workers 1. {cli_help_hint()}"
+            )
+        return min(requested_workers, max(svg_count, 1))
+    if svg_count <= 1:
+        return 1
+    return min(svg_count, max(os.cpu_count() or 1, 1))
+
+
+def build_batch_worker_args(args: argparse.Namespace) -> Dict[str, object]:
+    worker_args = dict(vars(args))
+    worker_args["font_path"] = str(Path(args.font_path).expanduser().resolve())
+    if worker_args.get("mystery_pattern"):
+        worker_args["mystery_pattern"] = str(Path(str(worker_args["mystery_pattern"])).expanduser().resolve())
+    worker_args["quiet_worker_output"] = True
+    worker_args["command_started_at"] = time.perf_counter()
+    return worker_args
+
+
+def run_batch_job(svg_path_str: str, output_pdf_str: str, worker_args: Dict[str, object]) -> BatchJobResult:
+    svg_path = Path(svg_path_str)
+    output_pdf = Path(output_pdf_str)
+    args = argparse.Namespace(**worker_args)
+    args.command_started_at = time.perf_counter()
+
+    started_at = time.perf_counter()
+    try:
+        register_montserrat_font(Path(str(args.font_path)).expanduser().resolve())
+        result = convert(svg_path, output_pdf, args)
+        return BatchJobResult(
+            svg_name=svg_path.name,
+            output_pdf_name=output_pdf.name,
+            elapsed_text=format_elapsed(time.perf_counter() - started_at),
+            ok=True,
+            palette_count=result.palette_count,
+            labels_placed=result.labels_placed,
+            labels_skipped=result.labels_skipped,
+            log_file_name=result.log_file_path.name if result.log_file_path is not None else None,
+        )
+    except SvgToPdfError as exc:
+        return BatchJobResult(
+            svg_name=svg_path.name,
+            output_pdf_name=output_pdf.name,
+            elapsed_text=format_elapsed(time.perf_counter() - started_at),
+            ok=False,
+            error_message=str(exc),
+        )
+    except Exception as exc:  # pragma: no cover - defensive final fallback
+        return BatchJobResult(
+            svg_name=svg_path.name,
+            output_pdf_name=output_pdf.name,
+            elapsed_text=format_elapsed(time.perf_counter() - started_at),
+            ok=False,
+            error_message=f"error inesperado: {exc}",
+        )
 
 
 def make_batch_output_dir(input_dir: Path) -> Path:
@@ -2926,12 +3112,27 @@ def make_batch_output_dir(input_dir: Path) -> Path:
 
 def run_single_file(input_svg: Path, args: argparse.Namespace) -> int:
     if input_svg.suffix.lower() != ".svg":
-        print("Error: la entrada debe ser un archivo .svg", file=sys.stderr)
+        print(
+            f"Error: la entrada debe ser un archivo .svg. Para procesar una carpeta usa el modo batch. {cli_input_examples()}. {cli_help_hint()}",
+            file=sys.stderr,
+        )
         return 1
 
     output_pdf = resolve_single_output_path(input_svg, args.output)
+    log_step("Argumentos validados", args)
     log_step(f"Iniciando modo archivo para {input_svg.name}", args)
     log_step(f"Salida prevista: {output_pdf}", args)
+
+    font_path = Path(args.font_path).expanduser().resolve()
+    try:
+        log_step(f"Registrando fuente desde {font_path}", args)
+        register_montserrat_font(font_path)
+    except SvgToPdfError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # pragma: no cover - defensive final fallback
+        print(f"Error inesperado registrando fuente: {exc}. {cli_help_hint()}", file=sys.stderr)
+        return 3
 
     try:
         result = convert(input_svg, output_pdf, args)
@@ -2939,7 +3140,7 @@ def run_single_file(input_svg: Path, args: argparse.Namespace) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:  # pragma: no cover - defensive final fallback
-        print(f"Error inesperado: {exc}", file=sys.stderr)
+        print(f"Error inesperado: {exc}. {cli_help_hint()}", file=sys.stderr)
         return 3
 
     total_elapsed = format_elapsed(time.perf_counter() - args.command_started_at)
@@ -2957,7 +3158,8 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
     if args.output:
         print(
             "Error: --output solo aplica al modo archivo. "
-            "En modo carpeta se usa automaticamente pdf-output-{timestamp}.",
+            "En modo carpeta se usa automaticamente pdf-output-{timestamp}. "
+            f"Ejemplo correcto: python {CLI_SCRIPT_NAME} dibujo.svg --output salida.pdf. {cli_help_hint()}",
             file=sys.stderr,
         )
         return 1
@@ -2965,7 +3167,7 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
     svg_files = collect_svg_inputs(input_dir)
     if not svg_files:
         print(
-            f"Error: no se encontraron archivos .svg en la carpeta {input_dir}",
+            f"Error: no se encontraron archivos .svg en la carpeta {input_dir}. Verifica la ruta y que los archivos terminen en .svg. {cli_input_examples()}. {cli_help_hint()}",
             file=sys.stderr,
         )
         return 1
@@ -2973,13 +3175,24 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
     try:
         batch_output_dir = make_batch_output_dir(input_dir)
     except Exception as exc:
-        print(f"Error: no se pudo crear la carpeta de salida batch: {exc}", file=sys.stderr)
+        print(
+            f"Error: no se pudo crear la carpeta de salida batch: {exc}. Revisa permisos de escritura en la carpeta de entrada. {cli_help_hint()}",
+            file=sys.stderr,
+        )
         return 2
 
     ok_count = 0
     fail_count = 0
     batch_started_at = time.perf_counter()
+    worker_args = build_batch_worker_args(args)
 
+    try:
+        batch_workers = resolve_batch_worker_count(args.batch_workers, len(svg_files))
+    except SvgToPdfError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    log_step("Argumentos validados", args)
     log_step(f"Iniciando modo batch en {input_dir}", args)
     print(f"Batch: {len(svg_files)} SVG(s) detectados en {input_dir}")
     print(f"Batch: salida en {batch_output_dir}")
@@ -2991,49 +3204,108 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
         current_file_index=1 if svg_files else None,
     )
 
-    for file_index, svg_file in enumerate(svg_files, start=1):
-        output_pdf = batch_output_dir / f"{svg_file.stem}.pdf"
-        file_started_at = time.perf_counter()
-        completed_before_current = ok_count + fail_count
-        log_batch_progress(
-            batch_started_at=batch_started_at,
-            files_total=len(svg_files),
-            files_completed=completed_before_current,
-            current_file=svg_file.name,
-            current_file_index=file_index,
-        )
-        log_step(f"Procesando archivo batch: {svg_file.name}", args)
+    if batch_workers > 1:
+        print(f"Batch: paralelismo activado por defecto con {batch_workers} procesos")
+        futures = {}
+        future_positions = {}
+        with ProcessPoolExecutor(max_workers=batch_workers) as executor:
+            for file_index, svg_file in enumerate(svg_files, start=1):
+                output_pdf = batch_output_dir / f"{svg_file.stem}.pdf"
+                future = executor.submit(run_batch_job, str(svg_file), str(output_pdf), worker_args)
+                futures[future] = svg_file.name
+                future_positions[future] = file_index
+
+            for future in as_completed(futures):
+                svg_name = futures[future]
+                try:
+                    batch_result = future.result()
+                except Exception as exc:  # pragma: no cover - defensive final fallback
+                    print(f"[ERROR] {svg_name}: error inesperado: {exc}. {cli_help_hint()}", file=sys.stderr)
+                    fail_count += 1
+                    log_batch_progress(
+                        batch_started_at=batch_started_at,
+                        files_total=len(svg_files),
+                        files_completed=ok_count + fail_count,
+                    )
+                    continue
+
+                if batch_result.ok:
+                    print(
+                        f"[OK] {batch_result.svg_name} -> {batch_result.output_pdf_name} | "
+                        f"colores: {batch_result.palette_count}, colocados: {batch_result.labels_placed}, "
+                        f"omitidos: {batch_result.labels_skipped}, tiempo: {batch_result.elapsed_text}"
+                    )
+                    if batch_result.log_file_name is not None:
+                        print(f"      log: {batch_result.log_file_name}")
+                    ok_count += 1
+                else:
+                    print(f"[ERROR] {batch_result.svg_name}: {batch_result.error_message}", file=sys.stderr)
+                    fail_count += 1
+                next_completed = ok_count + fail_count
+                next_file_index = min(next_completed + 1, len(svg_files)) if next_completed < len(svg_files) else None
+                next_file_name = svg_files[next_file_index - 1].name if next_file_index is not None else None
+                log_batch_progress(
+                    batch_started_at=batch_started_at,
+                    files_total=len(svg_files),
+                    files_completed=next_completed,
+                    current_file=next_file_name,
+                    current_file_index=next_file_index,
+                )
+    else:
+        print("Batch: modo serial (1 proceso)")
+        font_path = Path(args.font_path).expanduser().resolve()
         try:
-            result = convert(svg_file, output_pdf, args)
-            print(
-                f"[OK] {svg_file.name} -> {output_pdf.name} | "
-                f"colores: {result.palette_count}, colocados: {result.labels_placed}, omitidos: {result.labels_skipped}, "
-                f"tiempo: {format_elapsed(time.perf_counter() - file_started_at)}"
-            )
-            if result.log_file_path is not None:
-                print(f"      log: {result.log_file_path.name}")
-            ok_count += 1
-            log_batch_progress(
-                batch_started_at=batch_started_at,
-                files_total=len(svg_files),
-                files_completed=ok_count + fail_count,
-            )
+            log_step(f"Registrando fuente desde {font_path}", args)
+            register_montserrat_font(font_path)
         except SvgToPdfError as exc:
-            print(f"[ERROR] {svg_file.name}: {exc}", file=sys.stderr)
-            fail_count += 1
-            log_batch_progress(
-                batch_started_at=batch_started_at,
-                files_total=len(svg_files),
-                files_completed=ok_count + fail_count,
-            )
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
         except Exception as exc:  # pragma: no cover - defensive final fallback
-            print(f"[ERROR] {svg_file.name}: error inesperado: {exc}", file=sys.stderr)
-            fail_count += 1
+            print(f"Error inesperado registrando fuente: {exc}. {cli_help_hint()}", file=sys.stderr)
+            return 3
+        for file_index, svg_file in enumerate(svg_files, start=1):
+            output_pdf = batch_output_dir / f"{svg_file.stem}.pdf"
+            file_started_at = time.perf_counter()
+            completed_before_current = ok_count + fail_count
             log_batch_progress(
                 batch_started_at=batch_started_at,
                 files_total=len(svg_files),
-                files_completed=ok_count + fail_count,
+                files_completed=completed_before_current,
+                current_file=svg_file.name,
+                current_file_index=file_index,
             )
+            log_step(f"Procesando archivo batch: {svg_file.name}", args)
+            try:
+                result = convert(svg_file, output_pdf, args)
+                print(
+                    f"[OK] {svg_file.name} -> {output_pdf.name} | "
+                    f"colores: {result.palette_count}, colocados: {result.labels_placed}, omitidos: {result.labels_skipped}, "
+                    f"tiempo: {format_elapsed(time.perf_counter() - file_started_at)}"
+                )
+                if result.log_file_path is not None:
+                    print(f"      log: {result.log_file_path.name}")
+                ok_count += 1
+                log_batch_progress(
+                    batch_started_at=batch_started_at,
+                    files_total=len(svg_files),
+                    files_completed=ok_count + fail_count,
+                )
+            except SvgToPdfError as exc:
+                print(f"[ERROR] {svg_file.name}: {exc}", file=sys.stderr)
+                fail_count += 1
+                log_batch_progress(
+                    batch_started_at=batch_started_at,
+                    files_total=len(svg_files),
+                    files_completed=ok_count + fail_count,
+                )
+            except Exception as exc:  # pragma: no cover - defensive final fallback
+                print(f"[ERROR] {svg_file.name}: error inesperado: {exc}. {cli_help_hint()}", file=sys.stderr)
+                fail_count += 1
+                log_batch_progress(
+                    batch_started_at=batch_started_at,
+                    files_total=len(svg_files),
+                    files_completed=ok_count + fail_count,
+                )
 
     print("Batch finalizado")
     print(f"- SVG totales: {len(svg_files)}")
@@ -3049,9 +3321,13 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
 
 def validate_gray_value(value: float, label: str) -> float:
     if not math.isfinite(value):
-        raise SvgToPdfError(f"{label} no es un numero valido.")
+        raise SvgToPdfError(
+            f"{label} no es un numero valido. Usa un valor decimal entre 0 y 1, por ejemplo 0.70. {cli_help_hint()}"
+        )
     if value < 0.0 or value > 1.0:
-        raise SvgToPdfError(f"{label} debe estar entre 0 y 1.")
+        raise SvgToPdfError(
+            f"{label} debe estar entre 0 y 1. Ejemplo valido: 0.70. {cli_help_hint()}"
+        )
     return value
 
 
@@ -3064,7 +3340,7 @@ def resolve_representation_grays(
     if override_pair is not None:
         if len(override_pair) != 2:
             raise SvgToPdfError(
-                "--representation-grey requiere exactamente 2 valores: OUTLINE NUMBER"
+                f"--representation-grey requiere exactamente 2 valores: OUTLINE NUMBER. Ejemplo: --representation-grey 0.70 0.40. {cli_help_hint()}"
             )
         outline_gray = float(override_pair[0])
         number_gray = float(override_pair[1])
@@ -3081,7 +3357,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     input_path = Path(args.input_path).expanduser().resolve()
     if not input_path.exists():
-        print(f"Error: no existe la ruta de entrada: {input_path}", file=sys.stderr)
+        print(
+            f"Error: no existe la ruta de entrada: {input_path}. {cli_input_examples()}. {cli_help_hint()}",
+            file=sys.stderr,
+        )
         return 1
 
     try:
@@ -3096,25 +3375,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args.outline_gray = outline_gray
     args.number_gray = number_gray
     args.mystery_boundary_gray = mystery_boundary_gray
-    log_step("Argumentos validados", args)
-
-    font_path = Path(args.font_path).expanduser().resolve()
-    try:
-        log_step(f"Registrando fuente desde {font_path}", args)
-        register_montserrat_font(font_path)
-    except SvgToPdfError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 2
-    except Exception as exc:  # pragma: no cover - defensive final fallback
-        print(f"Error inesperado registrando fuente: {exc}", file=sys.stderr)
-        return 3
 
     if input_path.is_file():
         return run_single_file(input_path, args)
     if input_path.is_dir():
         return run_batch_directory(input_path, args)
 
-    print("Error: la ruta de entrada debe ser archivo o carpeta", file=sys.stderr)
+    print(
+        f"Error: la ruta de entrada debe ser archivo o carpeta. {cli_input_examples()}. {cli_help_hint()}",
+        file=sys.stderr,
+    )
     return 1
 
 
