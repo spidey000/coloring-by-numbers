@@ -36,6 +36,7 @@ La fuente usada para los numeros es `Montserrat` y se carga desde:
 ```bash
 python svg_to_paint_by_numbers_pdf.py <archivo.svg>
 python svg_to_paint_by_numbers_pdf.py <archivo.svg> -o <salida.pdf>
+python svg_to_paint_by_numbers_pdf.py <archivo.svg> --dynamic-obfuscation
 python svg_to_paint_by_numbers_pdf.py <archivo.svg> --mystery-pattern patterns/pattern.svg
 python svg_to_paint_by_numbers_pdf.py <carpeta_con_svgs>
 ```
@@ -44,6 +45,7 @@ Ejemplo con este repositorio:
 
 ```bash
 python svg_to_paint_by_numbers_pdf.py numbers.svg
+python svg_to_paint_by_numbers_pdf.py numbers.svg --dynamic-obfuscation
 python svg_to_paint_by_numbers_pdf.py numbers.svg --mystery-pattern patterns/pattern.svg
 python svg_to_paint_by_numbers_pdf.py inputs
 ```
@@ -70,6 +72,13 @@ En modo carpeta, tambien muestra progreso batch por archivo (`completados/total`
 - `-o/--output`: salida PDF explicita (solo modo archivo individual).
 - `--representation-grey OUTLINE NUMBER`: override de grises para contorno y numeros (0..1). Ejemplo: `--representation-grey 0.68 0.72`.
 - `--mystery-pattern`: aplica un SVG patron para fragmentar geometricamente todas las zonas del dibujo.
+- `--dynamic-obfuscation`: deriva una mascara procedural desde los propios trazos del SVG.
+- `--dynamic-obfuscation-density`: controla cuanta mascara se genera a partir de los trazos base.
+- `--dynamic-obfuscation-spacing`: separacion base entre subtramos de la mascara.
+- `--dynamic-obfuscation-offset`: cuanto se separan las copias paralelas respecto al trazo original.
+- `--dynamic-obfuscation-min-length`: longitud minima de subtramo para conservarse.
+- `--dynamic-obfuscation-grey`: tono gris de la mascara derivada.
+- `--dynamic-obfuscation-width`: grosor de la mascara derivada.
 - `--mystery-fit`: ajusta el patron al `viewBox` del dibujo (`contain`, `cover`, `stretch`).
 - `--mystery-min-fragment-area`: area minima para conservar un fragmento generado por el patron.
 - `--mystery-min-fragment-ratio`: proporcion minima respecto al area original para conservar un fragmento.
@@ -104,6 +113,7 @@ En modo carpeta, tambien muestra progreso batch por archivo (`completados/total`
 - No reutiliza rellenos de color originales en el arte final.
 - Traza toda la geometria con un gris tenue (default contorno `0.68`) sobre fondo blanco.
 - En modo mystery, puede fragmentar todas las zonas del dibujo usando un patron SVG superpuesto geometricamente.
+- En modo `--dynamic-obfuscation`, genera subtramos parciales y offsets paralelos a partir del propio SVG para camuflar la silueta sin redibujarla completa.
 - Dibuja tambien las divisiones internas del patron con un gris configurable para ofuscar la lectura de la silueta.
 - Mantiene posiciones/proporciones del SVG dentro de una pagina A4.
 
@@ -138,6 +148,14 @@ En modo carpeta, tambien muestra progreso batch por archivo (`completados/total`
 - Usa las fronteras del patron para dividir geometricamente las zonas coloreables.
 - Cada fragmento conserva el color original de su zona, por lo que la leyenda no cambia de concepto.
 - Si un fragmento resultante es demasiado pequeno o excesivo en cantidad, el sistema conserva la zona original.
+
+### 8) Mascara dinamica derivada del SVG
+
+- Reutiliza los propios `paths` del arte como semilla visual.
+- Corta cada trazo en subtramos parciales y les aplica offsets paralelos deterministas.
+- Recorta esos subtramos contra la union real de zonas para que la mascara solo viva dentro del dibujo.
+- El resultado ayuda a esconder la lectura global de la silueta, pero mantiene un lenguaje grafico coherente con el SVG original.
+- Se puede combinar con `--mystery-pattern` si quieres mezclar fragmentacion geometrica y trazos derivados.
 
 ## Manejo basico de errores
 

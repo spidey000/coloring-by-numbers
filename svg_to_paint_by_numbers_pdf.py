@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import colorsys
 import functools
+import hashlib
 import math
 import os
 import re
@@ -38,7 +39,7 @@ from reportlab.pdfgen import canvas
 from shapely.prepared import prep
 from shapely import STRtree, affinity
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon, box
-from shapely.ops import polylabel, unary_union
+from shapely.ops import polylabel, substring, unary_union
 from svgpathtools import Arc, CubicBezier, Line, Path as SvgPath, QuadraticBezier, parse_path
 
 try:
@@ -83,6 +84,8 @@ DEFAULT_FONT_PATH = Path(__file__).resolve().parent / "fonts" / "Montserrat-Regu
 REFERENCE_SYMBOLS = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 DEFAULT_MYSTERY_BOUNDARY_GRAY = 0.74
 DEFAULT_MYSTERY_BOUNDARY_WIDTH = 0.35
+DEFAULT_DYNAMIC_OBFUSCATION_GRAY = 0.78
+DEFAULT_DYNAMIC_OBFUSCATION_WIDTH = 0.45
 PROGRESS_RENDER_INTERVAL = 0.8
 PROGRESS_CHECK_FLUSH_INTERVAL = 250
 CLI_SCRIPT_NAME = Path(__file__).name
@@ -142,6 +145,7 @@ def build_help_epilog() -> str:
         f"  python {CLI_SCRIPT_NAME} inputs --batch-workers 1\n"
         f"  python {CLI_SCRIPT_NAME} dibujo.svg --include-strokes\n"
         f"  python {CLI_SCRIPT_NAME} dibujo.svg --representation-grey 0.70 0.40\n"
+        f"  python {CLI_SCRIPT_NAME} dibujo.svg --dynamic-obfuscation\n"
         f"  python {CLI_SCRIPT_NAME} dibujo.svg --mystery-pattern patterns/pattern.svg --mystery-fit contain\n"
         "\n"
         "Notas:\n"
@@ -262,6 +266,16 @@ class MysterySplitStats:
     zones_unsplit_over_limit: int = 0
     zones_split: int = 0
     zones_after: int = 0
+
+
+@dataclass
+class DynamicObfuscationStats:
+    """Diagnostics for SVG-derived obfuscation overlays."""
+
+    source_lines: int = 0
+    fragments_attempted: int = 0
+    fragments_kept: int = 0
+    variants_kept: int = 0
 
 
 @dataclass
@@ -643,6 +657,8 @@ def build_progress_steps(args: argparse.Namespace) -> List[ProgressStep]:
             ProgressStep("load-mystery-pattern", "cargar patron"),
             ProgressStep("apply-mystery-pattern", "fragmentar"),
         ])
+    if args.dynamic_obfuscation:
+        steps.append(ProgressStep("build-dynamic-obfuscation", "trazos mascara"))
     steps.extend([
         ProgressStep("build-palette", "paleta"),
         ProgressStep("render-outline", "contornos"),
@@ -651,6 +667,8 @@ def build_progress_steps(args: argparse.Namespace) -> List[ProgressStep]:
         ProgressStep("render-legend", "leyenda"),
         ProgressStep("render-save", "guardar"),
     ])
+    if args.dynamic_obfuscation:
+        steps.insert(-3, ProgressStep("render-dynamic-obfuscation", "mascara"))
     return steps
 
 
@@ -1266,6 +1284,152 @@ def path_to_stroke_polygons(path: SvgPath, stroke_width: float, max_step: float,
             if poly.area >= min_area:
                 polygons.append(poly)
     return polygons
+
+
+def subpath_to_line(subpath: SvgPath, max_step: float) -> Optional[LineString]:
+    if len(subpath) == 0:
+        return None
+
+    sampled: List[complex] = []
+    for segment in subpath:
+        points = sample_segment_points(segment, max_step=max_step)
+        if sampled:
+            sampled.extend(points[1:])
+        else:
+            sampled.extend(points)
+
+    coords = cleaned_coords(sampled)
+    if len(coords) >= 2 and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    if len(coords) < 2:
+        return None
+
+    line = LineString(coords)
+    if line.is_empty or line.length <= 1e-6:
+        return None
+    return line
+
+
+def stable_unit_value(*parts: object) -> float:
+    token = "|".join(str(part) for part in parts).encode("ascii", "ignore")
+    digest = hashlib.sha256(token).digest()
+    return int.from_bytes(digest[:8], "big") / float((1 << 64) - 1)
+
+
+def normalize_line_like_geometry(geometry) -> List[LineString]:
+    normalized: List[LineString] = []
+    for line in iter_line_strings(safe_make_valid(geometry)):
+        coords = list(line.coords)
+        if len(coords) < 2:
+            continue
+        candidate = LineString(coords)
+        if candidate.is_empty or candidate.length <= 1e-6:
+            continue
+        normalized.append(candidate)
+    return normalized
+
+
+def build_dynamic_obfuscation(
+    shapes: Sequence[SvgShape],
+    zones: Sequence[ColorZone],
+    max_step: float,
+    spacing: float,
+    offset: float,
+    density: float,
+    min_length: float,
+) -> Tuple[Optional[object], DynamicObfuscationStats]:
+    stats = DynamicObfuscationStats()
+    if not shapes or not zones:
+        return None, stats
+
+    drawing_union = safe_make_valid(unary_union([zone.geometry for zone in zones]))
+    if drawing_union.is_empty:
+        return None, stats
+
+    spacing = max(spacing, min_length * 1.5, 1.0)
+    density = max(0.15, density)
+    offset = max(0.0, offset)
+    min_length = max(0.6, min_length)
+    generated_lines: List[LineString] = []
+
+    for shape_index, shape in enumerate(shapes):
+        for subpath_index, subpath in enumerate(shape.path.continuous_subpaths()):
+            source_line = subpath_to_line(subpath, max_step=max_step)
+            if source_line is None or source_line.length < min_length:
+                continue
+
+            stats.source_lines += 1
+            source_length = source_line.length
+            fragment_budget = max(1, int(math.ceil((source_length / spacing) * density)))
+            cursor = spacing * (0.15 + (0.55 * stable_unit_value("cursor", shape_index, subpath_index)))
+            signature = (
+                round(source_length, 3),
+                *(round(value, 3) for value in source_line.bounds),
+            )
+
+            for fragment_index in range(fragment_budget):
+                stats.fragments_attempted += 1
+                gap = spacing * (0.10 + (0.32 * stable_unit_value("gap", signature, fragment_index)))
+                fragment_length = spacing * (
+                    0.65 + (1.15 * stable_unit_value("fragment-length", signature, fragment_index))
+                )
+                start_distance = cursor + gap
+                if start_distance >= source_length:
+                    break
+                end_distance = min(source_length, start_distance + fragment_length)
+                if (end_distance - start_distance) < min_length:
+                    cursor += spacing * (0.75 + (0.65 * stable_unit_value("advance", signature, fragment_index)))
+                    continue
+
+                fragment = substring(source_line, start_distance, end_distance)
+                fragment_lines = normalize_line_like_geometry(fragment)
+                if not fragment_lines:
+                    cursor += spacing * (0.75 + (0.65 * stable_unit_value("advance", signature, fragment_index)))
+                    continue
+                stats.fragments_kept += 1
+
+                for local_index, fragment_line in enumerate(fragment_lines):
+                    variants = [fragment_line]
+                    if offset > 0:
+                        for side in ("left", "right"):
+                            if stable_unit_value("offset-enabled", signature, fragment_index, local_index, side) < 0.28:
+                                continue
+                            offset_amount = offset * (
+                                0.45
+                                + (0.75 * stable_unit_value("offset-value", signature, fragment_index, local_index, side))
+                            )
+                            try:
+                                offset_geometry = fragment_line.parallel_offset(offset_amount, side, join_style=1)
+                            except Exception:
+                                continue
+                            variants.extend(normalize_line_like_geometry(offset_geometry))
+
+                    for variant_index, variant in enumerate(variants):
+                        if variant.length < min_length * 0.7:
+                            continue
+                        clip_geometry = safe_make_valid(variant.intersection(drawing_union))
+                        clipped_lines = normalize_line_like_geometry(clip_geometry)
+                        for clipped_line in clipped_lines:
+                            if clipped_line.length < min_length * 0.55:
+                                continue
+                            reveal_gate = stable_unit_value(
+                                "reveal-gate",
+                                signature,
+                                fragment_index,
+                                local_index,
+                                variant_index,
+                            )
+                            if reveal_gate > min(0.95, 0.52 + (density * 0.22)):
+                                continue
+                            generated_lines.append(clipped_line)
+                            stats.variants_kept += 1
+
+                cursor += spacing * (0.75 + (0.65 * stable_unit_value("advance", signature, fragment_index)))
+
+    if not generated_lines:
+        return None, stats
+
+    return unary_union(generated_lines), stats
 
 
 def bounds_overlap(
@@ -2562,6 +2726,9 @@ def render_pdf(
     mystery_boundaries=None,
     mystery_boundary_gray: float = DEFAULT_MYSTERY_BOUNDARY_GRAY,
     mystery_boundary_width: float = DEFAULT_MYSTERY_BOUNDARY_WIDTH,
+    dynamic_obfuscation_lines=None,
+    dynamic_obfuscation_gray: float = DEFAULT_DYNAMIC_OBFUSCATION_GRAY,
+    dynamic_obfuscation_width: float = DEFAULT_DYNAMIC_OBFUSCATION_WIDTH,
     args: Optional[argparse.Namespace] = None,
     diagnostics: Optional[StageDiagnostics] = None,
     label_diagnostics: Optional[LabelRenderDiagnostics] = None,
@@ -2613,6 +2780,24 @@ def render_pdf(
     if progress is not None:
         progress.complete_step("render-mystery-boundaries", elapsed)
     log_stage_timing("render-mystery-boundaries", elapsed, args)
+
+    if getattr(args, "dynamic_obfuscation", False):
+        stage_started_at = time.perf_counter()
+        if progress is not None:
+            progress.start_step("render-dynamic-obfuscation")
+        draw_line_geometry(
+            pdf,
+            geometry=dynamic_obfuscation_lines,
+            transform=transform,
+            line_width=dynamic_obfuscation_width,
+            stroke_gray=dynamic_obfuscation_gray,
+        )
+        elapsed = time.perf_counter() - stage_started_at
+        if diagnostics is not None:
+            diagnostics.record("render-dynamic-obfuscation", elapsed)
+        if progress is not None:
+            progress.complete_step("render-dynamic-obfuscation", elapsed)
+        log_stage_timing("render-dynamic-obfuscation", elapsed, args)
 
     stage_started_at = time.perf_counter()
     if progress is not None:
@@ -2704,6 +2889,7 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Conve
     progress.complete_step("read-svg", elapsed)
     log_stage_timing("read-svg", elapsed, args, shapes=len(shapes))
     mystery_boundaries = None
+    dynamic_obfuscation_lines = None
 
     log_step("Extrayendo zonas coloreables", args)
     stage_started_at = time.perf_counter()
@@ -2803,6 +2989,43 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Conve
         )
         log_step(f"Zonas tras mystery pattern: {len(zones)}", args)
 
+    if args.dynamic_obfuscation:
+        log_step("Generando mascara dinamica a partir del SVG", args)
+        stage_started_at = time.perf_counter()
+        progress.start_step("build-dynamic-obfuscation")
+        dynamic_obfuscation_lines, dynamic_stats = build_dynamic_obfuscation(
+            shapes=shapes,
+            zones=zones,
+            max_step=args.max_segment_step,
+            spacing=args.dynamic_obfuscation_spacing,
+            offset=args.dynamic_obfuscation_offset,
+            density=args.dynamic_obfuscation_density,
+            min_length=args.dynamic_obfuscation_min_length,
+        )
+        elapsed = time.perf_counter() - stage_started_at
+        diagnostics.record(
+            "build-dynamic-obfuscation",
+            elapsed,
+            source_lines=dynamic_stats.source_lines,
+            fragments_attempted=dynamic_stats.fragments_attempted,
+            fragments_kept=dynamic_stats.fragments_kept,
+            variants_kept=dynamic_stats.variants_kept,
+        )
+        progress.complete_step("build-dynamic-obfuscation", elapsed)
+        log_stage_timing(
+            "build-dynamic-obfuscation",
+            elapsed,
+            args,
+            source_lines=dynamic_stats.source_lines,
+            fragments_attempted=dynamic_stats.fragments_attempted,
+            fragments_kept=dynamic_stats.fragments_kept,
+            variants_kept=dynamic_stats.variants_kept,
+        )
+        log_step(
+            f"Mascara derivada lista: {dynamic_stats.variants_kept} trazos recortados desde {dynamic_stats.source_lines} lineas base",
+            args,
+        )
+
     if not zones:
         raise SvgToPdfError(
             "No se detectaron zonas rellenables en el SVG. Usa formas con fill o prueba --include-strokes si el dibujo usa solo trazos. "
@@ -2844,6 +3067,9 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Conve
         mystery_boundaries=mystery_boundaries,
         mystery_boundary_gray=args.mystery_boundary_gray,
         mystery_boundary_width=args.mystery_boundary_width,
+        dynamic_obfuscation_lines=dynamic_obfuscation_lines,
+        dynamic_obfuscation_gray=args.dynamic_obfuscation_gray,
+        dynamic_obfuscation_width=args.dynamic_obfuscation_width,
         args=args,
         diagnostics=diagnostics,
         label_diagnostics=label_diagnostics,
@@ -2938,6 +3164,53 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mystery-pattern",
         help="Ruta a un archivo SVG patron para fragmentar geometricamente todo el dibujo.",
+    )
+    parser.add_argument(
+        "--dynamic-obfuscation",
+        action="store_true",
+        help=(
+            "Genera una mascara procedural a partir de los propios trazos del SVG para ocultar mejor la silueta."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-obfuscation-density",
+        type=float,
+        default=0.4,
+        help=(
+            "Densidad relativa de la mascara dinamica derivada del SVG. Sube el valor para cruzar mas trazos."
+        ),
+    )
+    parser.add_argument(
+        "--dynamic-obfuscation-spacing",
+        type=float,
+        default=24.0,
+        help="Separacion base entre fragmentos de la mascara dinamica en unidades SVG.",
+    )
+    parser.add_argument(
+        "--dynamic-obfuscation-offset",
+        type=float,
+        default=2.8,
+        help="Offset maximo usado para crear copias paralelas del trazo original en la mascara dinamica.",
+    )
+    parser.add_argument(
+        "--dynamic-obfuscation-min-length",
+        type=float,
+        default=8.0,
+        help="Longitud minima SVG que debe tener un subtramo para conservarse en la mascara dinamica.",
+    )
+    parser.add_argument(
+        "--dynamic-obfuscation-grey",
+        "--dynamic-obfuscation-gray",
+        dest="dynamic_obfuscation_gray",
+        type=float,
+        default=DEFAULT_DYNAMIC_OBFUSCATION_GRAY,
+        help="Tono gris de la mascara dinamica derivada del SVG (0..1).",
+    )
+    parser.add_argument(
+        "--dynamic-obfuscation-width",
+        type=float,
+        default=DEFAULT_DYNAMIC_OBFUSCATION_WIDTH,
+        help="Grosor en puntos de la mascara dinamica derivada del SVG.",
     )
     parser.add_argument(
         "--mystery-fit",
@@ -3351,6 +3624,19 @@ def validate_gray_value(value: float, label: str) -> float:
     return value
 
 
+def validate_positive_value(value: float, label: str, *, allow_zero: bool = False) -> float:
+    if not math.isfinite(value):
+        raise SvgToPdfError(
+            f"{label} no es un numero valido. Usa un decimal positivo, por ejemplo 1.0. {cli_help_hint()}"
+        )
+    if allow_zero:
+        if value < 0.0:
+            raise SvgToPdfError(f"{label} debe ser cero o positivo. {cli_help_hint()}")
+    elif value <= 0.0:
+        raise SvgToPdfError(f"{label} debe ser mayor que 0. {cli_help_hint()}")
+    return value
+
+
 def resolve_representation_grays(
     override_pair: Optional[Sequence[float]],
 ) -> Tuple[float, float]:
@@ -3389,12 +3675,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.mystery_boundary_gray,
             "Mystery boundary grey",
         )
+        dynamic_obfuscation_gray = validate_gray_value(
+            args.dynamic_obfuscation_gray,
+            "Dynamic obfuscation grey",
+        )
+        dynamic_obfuscation_density = validate_positive_value(
+            args.dynamic_obfuscation_density,
+            "Dynamic obfuscation density",
+        )
+        dynamic_obfuscation_spacing = validate_positive_value(
+            args.dynamic_obfuscation_spacing,
+            "Dynamic obfuscation spacing",
+        )
+        dynamic_obfuscation_offset = validate_positive_value(
+            args.dynamic_obfuscation_offset,
+            "Dynamic obfuscation offset",
+            allow_zero=True,
+        )
+        dynamic_obfuscation_min_length = validate_positive_value(
+            args.dynamic_obfuscation_min_length,
+            "Dynamic obfuscation min length",
+        )
+        dynamic_obfuscation_width = validate_positive_value(
+            args.dynamic_obfuscation_width,
+            "Dynamic obfuscation width",
+        )
     except SvgToPdfError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     args.outline_gray = outline_gray
     args.number_gray = number_gray
     args.mystery_boundary_gray = mystery_boundary_gray
+    args.dynamic_obfuscation_gray = dynamic_obfuscation_gray
+    args.dynamic_obfuscation_density = dynamic_obfuscation_density
+    args.dynamic_obfuscation_spacing = dynamic_obfuscation_spacing
+    args.dynamic_obfuscation_offset = dynamic_obfuscation_offset
+    args.dynamic_obfuscation_min_length = dynamic_obfuscation_min_length
+    args.dynamic_obfuscation_width = dynamic_obfuscation_width
 
     if input_path.is_file():
         return run_single_file(input_path, args)
