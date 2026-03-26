@@ -1807,13 +1807,12 @@ def apply_mystery_pattern(
         return list(zones), None, stats
 
     split_zones: List[ColorZone] = []
-    union_geometries = []
+    boundary_geometries = []
     pattern_bounds = pattern_lines.bounds
     for zone in zones:
         if not bounds_overlap(zone.geometry.bounds, pattern_bounds):
             stats.bbox_skips += 1
             split_zones.append(zone)
-            union_geometries.append(zone.geometry)
             continue
 
         stats.split_attempts += 1
@@ -1828,13 +1827,14 @@ def apply_mystery_pattern(
             stats=stats,
         )
         split_zones.extend(parts)
-        union_geometries.extend([part.geometry for part in parts])
+        if len(parts) > 1:
+            boundary_geometries.extend([part.geometry for part in parts])
 
-    if not union_geometries:
+    if not boundary_geometries:
         stats.zones_after = len(zones)
         return list(zones), None, stats
 
-    drawing_union = unary_union(union_geometries)
+    drawing_union = unary_union(boundary_geometries)
     clipped_boundaries = safe_make_valid(pattern_lines.intersection(drawing_union))
     stats.zones_after = len(split_zones)
     return split_zones, clipped_boundaries, stats
