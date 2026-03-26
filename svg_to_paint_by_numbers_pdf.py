@@ -21,6 +21,7 @@ import functools
 import hashlib
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -38,8 +39,8 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from shapely.prepared import prep
 from shapely import STRtree, affinity
-from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon, box
-from shapely.ops import polylabel, substring, unary_union
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon, box
+from shapely.ops import polylabel, unary_union, voronoi_diagram
 from svgpathtools import Arc, CubicBezier, Line, Path as SvgPath, QuadraticBezier, parse_path
 
 try:
@@ -86,6 +87,8 @@ DEFAULT_MYSTERY_BOUNDARY_GRAY = 0.74
 DEFAULT_MYSTERY_BOUNDARY_WIDTH = 0.35
 DEFAULT_DYNAMIC_OBFUSCATION_GRAY = 0.78
 DEFAULT_DYNAMIC_OBFUSCATION_WIDTH = 0.45
+DEFAULT_DYNAMIC_OBFUSCATION_INTERIOR_RATIO = 0.4
+DEFAULT_DYNAMIC_OBFUSCATION_JITTER = 0.85
 PROGRESS_RENDER_INTERVAL = 0.8
 PROGRESS_CHECK_FLUSH_INTERVAL = 250
 CLI_SCRIPT_NAME = Path(__file__).name
@@ -145,6 +148,7 @@ def build_help_epilog() -> str:
         f"  python {CLI_SCRIPT_NAME} inputs --batch-workers 1\n"
         f"  python {CLI_SCRIPT_NAME} dibujo.svg --include-strokes\n"
         f"  python {CLI_SCRIPT_NAME} dibujo.svg --representation-grey 0.70 0.40\n"
+        f"  python {CLI_SCRIPT_NAME} dibujo.svg --no-random-mystery-pattern\n"
         f"  python {CLI_SCRIPT_NAME} dibujo.svg --dynamic-obfuscation\n"
         f"  python {CLI_SCRIPT_NAME} dibujo.svg --mystery-pattern patterns/pattern.svg --mystery-fit contain\n"
         "\n"
@@ -270,12 +274,13 @@ class MysterySplitStats:
 
 @dataclass
 class DynamicObfuscationStats:
-    """Diagnostics for SVG-derived obfuscation overlays."""
+    """Diagnostics for mixed Voronoi obfuscation overlays."""
 
     source_lines: int = 0
-    fragments_attempted: int = 0
-    fragments_kept: int = 0
-    variants_kept: int = 0
+    edge_seeds: int = 0
+    interior_seeds: int = 0
+    cells_kept: int = 0
+    edges_kept: int = 0
 
 
 @dataclass
@@ -702,6 +707,10 @@ def make_test_log_path(output_pdf: Path) -> Path:
         log_path = output_pdf.with_name(f"{output_pdf.stem}_log_{stamp}-{suffix:02d}.txt")
         suffix += 1
     return log_path
+
+
+def timestamped_output_stem(base_stem: str) -> str:
+    return f"{base_stem}_{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
 
 
 def build_test_log_text(
@@ -1329,14 +1338,89 @@ def normalize_line_like_geometry(geometry) -> List[LineString]:
     return normalized
 
 
+def dedupe_seed_points(points: Sequence[Tuple[float, float]], precision: int = 3) -> List[Tuple[float, float]]:
+    unique: List[Tuple[float, float]] = []
+    seen = set()
+    for x, y in points:
+        key = (round(float(x), precision), round(float(y), precision))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((float(x), float(y)))
+    return unique
+
+
+def sample_line_seed_points(line: LineString, spacing: float) -> List[Tuple[float, float]]:
+    if line.is_empty or line.length <= 1e-6:
+        return []
+    if spacing <= 0:
+        spacing = max(line.length / 8.0, 1.0)
+    sample_count = max(2, int(math.ceil(line.length / spacing)) + 1)
+    points: List[Tuple[float, float]] = []
+    for index in range(sample_count):
+        fraction = index / (sample_count - 1)
+        point = line.interpolate(fraction * line.length)
+        points.append((point.x, point.y))
+    return points
+
+
+def deterministic_interior_seeds(
+    polygon: Polygon,
+    *,
+    zone_index: int,
+    effective_spacing: float,
+    jitter: float,
+    interior_ratio: float,
+) -> List[Tuple[float, float]]:
+    seeds: List[Tuple[float, float]] = []
+    anchors = [
+        polylabel(polygon, tolerance=max(0.5, effective_spacing * 0.08)),
+        polygon.representative_point(),
+        polygon.centroid,
+    ]
+    for anchor in anchors:
+        if polygon.covers(anchor):
+            seeds.append((anchor.x, anchor.y))
+
+    area_factor = polygon.area / max(effective_spacing * effective_spacing, 1.0)
+    extra_count = int(
+        min(12, math.ceil(area_factor * (0.18 + (0.55 * interior_ratio))))
+    )
+    if extra_count <= 0 or not seeds:
+        return dedupe_seed_points(seeds)
+
+    base_x, base_y = seeds[0]
+    radius_base = max(effective_spacing * 0.55, min(polygon.bounds[2] - polygon.bounds[0], polygon.bounds[3] - polygon.bounds[1]) * 0.18)
+    for extra_index in range(extra_count):
+        angle = stable_unit_value("voronoi-angle", zone_index, extra_index) * math.tau
+        radius = radius_base * (0.45 + (jitter * stable_unit_value("voronoi-radius", zone_index, extra_index)))
+        candidate = Point(
+            base_x + (math.cos(angle) * radius),
+            base_y + (math.sin(angle) * radius),
+        )
+        if not polygon.covers(candidate):
+            shrink = 0.72
+            for _ in range(5):
+                radius *= shrink
+                candidate = Point(
+                    base_x + (math.cos(angle) * radius),
+                    base_y + (math.sin(angle) * radius),
+                )
+                if polygon.covers(candidate):
+                    break
+        if polygon.covers(candidate):
+            seeds.append((candidate.x, candidate.y))
+    return dedupe_seed_points(seeds)
+
+
 def build_dynamic_obfuscation(
     shapes: Sequence[SvgShape],
     zones: Sequence[ColorZone],
     max_step: float,
     spacing: float,
-    offset: float,
     density: float,
-    min_length: float,
+    interior_ratio: float,
+    jitter: float,
 ) -> Tuple[Optional[object], DynamicObfuscationStats]:
     stats = DynamicObfuscationStats()
     if not shapes or not zones:
@@ -1346,90 +1430,72 @@ def build_dynamic_obfuscation(
     if drawing_union.is_empty:
         return None, stats
 
-    spacing = max(spacing, min_length * 1.5, 1.0)
     density = max(0.15, density)
-    offset = max(0.0, offset)
-    min_length = max(0.6, min_length)
-    generated_lines: List[LineString] = []
+    spacing = max(3.0, spacing)
+    interior_ratio = max(0.0, min(1.0, interior_ratio))
+    jitter = max(0.0, jitter)
+    effective_spacing = max(2.5, spacing / math.sqrt(density))
+    seed_points: List[Tuple[float, float]] = []
 
     for shape_index, shape in enumerate(shapes):
         for subpath_index, subpath in enumerate(shape.path.continuous_subpaths()):
             source_line = subpath_to_line(subpath, max_step=max_step)
-            if source_line is None or source_line.length < min_length:
+            if source_line is None or source_line.length < effective_spacing * 0.35:
                 continue
 
             stats.source_lines += 1
-            source_length = source_line.length
-            fragment_budget = max(1, int(math.ceil((source_length / spacing) * density)))
-            cursor = spacing * (0.15 + (0.55 * stable_unit_value("cursor", shape_index, subpath_index)))
-            signature = (
-                round(source_length, 3),
-                *(round(value, 3) for value in source_line.bounds),
+            edge_points = sample_line_seed_points(source_line, effective_spacing)
+            seed_points.extend(edge_points)
+            stats.edge_seeds += len(edge_points)
+
+    for zone_index, zone in enumerate(zones):
+        for polygon in iter_polygons(zone.geometry):
+            interior_points = deterministic_interior_seeds(
+                polygon,
+                zone_index=zone_index,
+                effective_spacing=effective_spacing,
+                jitter=jitter,
+                interior_ratio=interior_ratio,
             )
+            seed_points.extend(interior_points)
+            stats.interior_seeds += len(interior_points)
 
-            for fragment_index in range(fragment_budget):
-                stats.fragments_attempted += 1
-                gap = spacing * (0.10 + (0.32 * stable_unit_value("gap", signature, fragment_index)))
-                fragment_length = spacing * (
-                    0.65 + (1.15 * stable_unit_value("fragment-length", signature, fragment_index))
-                )
-                start_distance = cursor + gap
-                if start_distance >= source_length:
-                    break
-                end_distance = min(source_length, start_distance + fragment_length)
-                if (end_distance - start_distance) < min_length:
-                    cursor += spacing * (0.75 + (0.65 * stable_unit_value("advance", signature, fragment_index)))
-                    continue
-
-                fragment = substring(source_line, start_distance, end_distance)
-                fragment_lines = normalize_line_like_geometry(fragment)
-                if not fragment_lines:
-                    cursor += spacing * (0.75 + (0.65 * stable_unit_value("advance", signature, fragment_index)))
-                    continue
-                stats.fragments_kept += 1
-
-                for local_index, fragment_line in enumerate(fragment_lines):
-                    variants = [fragment_line]
-                    if offset > 0:
-                        for side in ("left", "right"):
-                            if stable_unit_value("offset-enabled", signature, fragment_index, local_index, side) < 0.28:
-                                continue
-                            offset_amount = offset * (
-                                0.45
-                                + (0.75 * stable_unit_value("offset-value", signature, fragment_index, local_index, side))
-                            )
-                            try:
-                                offset_geometry = fragment_line.parallel_offset(offset_amount, side, join_style=1)
-                            except Exception:
-                                continue
-                            variants.extend(normalize_line_like_geometry(offset_geometry))
-
-                    for variant_index, variant in enumerate(variants):
-                        if variant.length < min_length * 0.7:
-                            continue
-                        clip_geometry = safe_make_valid(variant.intersection(drawing_union))
-                        clipped_lines = normalize_line_like_geometry(clip_geometry)
-                        for clipped_line in clipped_lines:
-                            if clipped_line.length < min_length * 0.55:
-                                continue
-                            reveal_gate = stable_unit_value(
-                                "reveal-gate",
-                                signature,
-                                fragment_index,
-                                local_index,
-                                variant_index,
-                            )
-                            if reveal_gate > min(0.95, 0.52 + (density * 0.22)):
-                                continue
-                            generated_lines.append(clipped_line)
-                            stats.variants_kept += 1
-
-                cursor += spacing * (0.75 + (0.65 * stable_unit_value("advance", signature, fragment_index)))
-
-    if not generated_lines:
+    seed_points = dedupe_seed_points(seed_points)
+    if len(seed_points) < 4:
         return None, stats
 
-    return unary_union(generated_lines), stats
+    min_x, min_y, max_x, max_y = drawing_union.bounds
+    pad = max(effective_spacing * 1.5, 6.0)
+    envelope = box(min_x - pad, min_y - pad, max_x + pad, max_y + pad)
+
+    cells = voronoi_diagram(MultiPoint(seed_points), envelope=envelope, edges=False)
+    clipped_boundaries = []
+    min_cell_area = max(1.0, (effective_spacing * effective_spacing) * 0.04)
+    for cell in iter_polygons(cells):
+        clipped = safe_make_valid(cell.intersection(drawing_union))
+        if clipped.is_empty:
+            continue
+        kept_any = False
+        for polygon in iter_polygons(clipped):
+            if polygon.area < min_cell_area:
+                continue
+            clipped_boundaries.append(polygon.boundary)
+            kept_any = True
+        if kept_any:
+            stats.cells_kept += 1
+
+    if not clipped_boundaries:
+        return None, stats
+
+    boundary_geometry = safe_make_valid(unary_union(clipped_boundaries))
+    normalized_edges = [
+        line for line in normalize_line_like_geometry(boundary_geometry) if line.length >= effective_spacing * 0.22
+    ]
+    stats.edges_kept = len(normalized_edges)
+    if not normalized_edges:
+        return None, stats
+
+    return unary_union(normalized_edges), stats
 
 
 def bounds_overlap(
@@ -2616,10 +2682,30 @@ def draw_labels(
 
 def compute_legend_height(color_count: int) -> float:
     if color_count <= 0:
-        return 110.0
-    base = 70.0
-    rows_estimate = max(1, math.ceil(color_count / 6.0))
-    return min(220.0, base + (rows_estimate * 20.0))
+        return 56.0
+    return 72.0
+
+
+def draw_test_layout_guides(
+    pdf: canvas.Canvas,
+    page_width: float,
+    legend_height: float,
+    image_bottom_y: float,
+) -> None:
+    margin = 24.0
+    left = margin
+    right = page_width - margin
+    legend_bottom = margin + 2.0
+    legend_top = margin + legend_height - 2.0
+
+    pdf.saveState()
+    pdf.setStrokeGray(0.55)
+    pdf.setLineWidth(0.7)
+    pdf.setDash(4, 3)
+    pdf.line(left, legend_bottom, right, legend_bottom)
+    pdf.line(left, legend_top, right, legend_top)
+    pdf.line(left, image_bottom_y, right, image_bottom_y)
+    pdf.restoreState()
 
 
 def draw_legend(
@@ -2629,6 +2715,8 @@ def draw_legend(
     page_width: float,
     legend_height: float,
     show_hex: bool,
+    test_mode: bool = False,
+    image_bottom_y: Optional[float] = None,
 ) -> None:
     margin = 24.0
     bottom = margin
@@ -2636,52 +2724,92 @@ def draw_legend(
     left = margin
     right = page_width - margin
 
-    pdf.setStrokeColor(colors.black)
-    pdf.setLineWidth(0.8)
-    pdf.line(left, top, right, top)
-
-    pdf.setFillColor(colors.black)
-    pdf.setFont(FONT_NAME, 10)
-    pdf.drawString(left, top - 14, "Leyenda de colores")
-
     if not palette:
         pdf.setFont(FONT_NAME, 9)
-        pdf.drawString(left, top - 30, "No se detectaron colores numerables.")
+        pdf.drawString(left, bottom + 12.0, "No se detectaron colores numerables.")
         return
 
     available_width = right - left
-    grid_top = top - 22.0
-    grid_bottom = bottom + 6.0
-    available_height = max(14.0, grid_top - grid_bottom)
+    grid_bottom = bottom + 2.0
+    grid_top = top - 2.0
+    available_height = max(12.0, grid_top - grid_bottom)
 
-    swatch_size = 22.0
-    col_gap = 14.0
-    row_gap = 10.0
-    hex_width = 46.0 if show_hex else 0.0
+    if test_mode and image_bottom_y is not None:
+        draw_test_layout_guides(pdf, page_width, legend_height, image_bottom_y)
 
-    cols = 1
-    rows = len(palette)
-    row_height = swatch_size + row_gap
-    item_width = swatch_size + hex_width
+    layout = None
+    max_rows = min(2, len(palette))
+    for swatch_size in range(22, 7, -1):
+        row_gap = max(3.0, swatch_size * 0.2)
+        col_gap = swatch_size / 4.0
+        hex_font_size = max(5.5, swatch_size * 0.3)
+        hex_width = 0.0
+        if show_hex:
+            hex_width = max(pdfmetrics.stringWidth(color_hex.upper(), FONT_NAME, hex_font_size) for color_hex in palette) + 4.0
 
-    while swatch_size >= 14.0:
-        row_height = swatch_size + row_gap
-        item_width = swatch_size + hex_width
-        cols = max(1, min(len(palette), int((available_width + col_gap) // (item_width + col_gap))))
-        rows = math.ceil(len(palette) / cols)
-        if rows * row_height <= available_height:
+        for rows in range(1, max_rows + 1):
+            cols = math.ceil(len(palette) / rows)
+            item_width = swatch_size + hex_width
+            total_grid_width = (cols * item_width) + ((cols - 1) * col_gap)
+            total_grid_height = (rows * swatch_size) + ((rows - 1) * row_gap)
+            if total_grid_width <= available_width and total_grid_height <= available_height:
+                layout = {
+                    "swatch_size": float(swatch_size),
+                    "row_gap": row_gap,
+                    "col_gap": col_gap,
+                    "hex_font_size": hex_font_size,
+                    "hex_width": hex_width,
+                    "rows": rows,
+                    "cols": cols,
+                    "item_width": item_width,
+                    "total_grid_width": total_grid_width,
+                }
+                break
+        if layout is not None:
             break
-        swatch_size -= 1.0
 
-    total_grid_width = (cols * item_width) + ((cols - 1) * col_gap)
+    if layout is None:
+        swatch_size = 8.0
+        row_gap = 3.0
+        col_gap = swatch_size / 4.0
+        hex_font_size = 5.5
+        hex_width = 0.0
+        if show_hex:
+            hex_width = max(pdfmetrics.stringWidth(color_hex.upper(), FONT_NAME, hex_font_size) for color_hex in palette) + 4.0
+        rows = max_rows
+        cols = math.ceil(len(palette) / rows)
+        item_width = swatch_size + hex_width
+        total_grid_width = (cols * item_width) + ((cols - 1) * col_gap)
+        layout = {
+            "swatch_size": swatch_size,
+            "row_gap": row_gap,
+            "col_gap": col_gap,
+            "hex_font_size": hex_font_size,
+            "hex_width": hex_width,
+            "rows": rows,
+            "cols": cols,
+            "item_width": item_width,
+            "total_grid_width": total_grid_width,
+        }
+
+    swatch_size = layout["swatch_size"]
+    row_gap = layout["row_gap"]
+    col_gap = layout["col_gap"]
+    hex_font_size = layout["hex_font_size"]
+    rows = layout["rows"]
+    cols = layout["cols"]
+    item_width = layout["item_width"]
+    total_grid_width = layout["total_grid_width"]
+    total_grid_height = (rows * swatch_size) + ((rows - 1) * row_gap)
     grid_left = left + max(0.0, (available_width - total_grid_width) / 2.0)
+    grid_bottom_aligned = grid_bottom
 
     for idx, color_hex in enumerate(palette):
         row = idx // cols
         col = idx % cols
 
         item_x = grid_left + (col * (item_width + col_gap))
-        swatch_y = grid_top - ((row + 1) * row_height)
+        swatch_y = grid_bottom_aligned + ((rows - row - 1) * (swatch_size + row_gap))
         swatch_x = item_x
 
         pdf.setFillColor(colors.HexColor(color_hex))
@@ -2706,7 +2834,7 @@ def draw_legend(
 
         if show_hex:
             pdf.setFillColor(colors.black)
-            pdf.setFont(FONT_NAME, 7.5)
+            pdf.setFont(FONT_NAME, hex_font_size)
             pdf.drawString(swatch_x + swatch_size + 5.0, swatch_y + (swatch_size * 0.35), color_hex.upper())
 
 
@@ -2848,6 +2976,8 @@ def render_pdf(
         page_width=page_width,
         legend_height=legend_height,
         show_hex=show_hex,
+        test_mode=getattr(args, "test", False),
+        image_bottom_y=transform.draw_y,
     )
     elapsed = time.perf_counter() - stage_started_at
     if diagnostics is not None:
@@ -2871,6 +3001,7 @@ def render_pdf(
 
 
 def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> ConvertResult:
+    resolve_mystery_pattern_for_run(svg_path, args)
     diagnostics = StageDiagnostics()
     label_diagnostics = LabelRenderDiagnostics() if getattr(args, "test", False) else None
     progress = CliProgressReporter(
@@ -2990,7 +3121,7 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Conve
         log_step(f"Zonas tras mystery pattern: {len(zones)}", args)
 
     if args.dynamic_obfuscation:
-        log_step("Generando mascara dinamica a partir del SVG", args)
+        log_step("Generando mascara Voronoi mixta a partir del SVG", args)
         stage_started_at = time.perf_counter()
         progress.start_step("build-dynamic-obfuscation")
         dynamic_obfuscation_lines, dynamic_stats = build_dynamic_obfuscation(
@@ -2998,18 +3129,19 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Conve
             zones=zones,
             max_step=args.max_segment_step,
             spacing=args.dynamic_obfuscation_spacing,
-            offset=args.dynamic_obfuscation_offset,
             density=args.dynamic_obfuscation_density,
-            min_length=args.dynamic_obfuscation_min_length,
+            interior_ratio=args.dynamic_obfuscation_interior_ratio,
+            jitter=args.dynamic_obfuscation_jitter,
         )
         elapsed = time.perf_counter() - stage_started_at
         diagnostics.record(
             "build-dynamic-obfuscation",
             elapsed,
             source_lines=dynamic_stats.source_lines,
-            fragments_attempted=dynamic_stats.fragments_attempted,
-            fragments_kept=dynamic_stats.fragments_kept,
-            variants_kept=dynamic_stats.variants_kept,
+            edge_seeds=dynamic_stats.edge_seeds,
+            interior_seeds=dynamic_stats.interior_seeds,
+            cells_kept=dynamic_stats.cells_kept,
+            edges_kept=dynamic_stats.edges_kept,
         )
         progress.complete_step("build-dynamic-obfuscation", elapsed)
         log_stage_timing(
@@ -3017,12 +3149,13 @@ def convert(svg_path: Path, output_pdf: Path, args: argparse.Namespace) -> Conve
             elapsed,
             args,
             source_lines=dynamic_stats.source_lines,
-            fragments_attempted=dynamic_stats.fragments_attempted,
-            fragments_kept=dynamic_stats.fragments_kept,
-            variants_kept=dynamic_stats.variants_kept,
+            edge_seeds=dynamic_stats.edge_seeds,
+            interior_seeds=dynamic_stats.interior_seeds,
+            cells_kept=dynamic_stats.cells_kept,
+            edges_kept=dynamic_stats.edges_kept,
         )
         log_step(
-            f"Mascara derivada lista: {dynamic_stats.variants_kept} trazos recortados desde {dynamic_stats.source_lines} lineas base",
+            f"Mascara Voronoi lista: {dynamic_stats.edges_kept} aristas internas desde {dynamic_stats.edge_seeds + dynamic_stats.interior_seeds} semillas",
             args,
         )
 
@@ -3127,7 +3260,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="PDF",
         help=(
             "Ruta del PDF de salida para modo archivo. "
-            "Si se omite, usa `output/<entrada>_paint_by_numbers.pdf`."
+            "Si se omite, usa `output/<entrada>_paint_by_numbers_<timestamp>.pdf`."
         ),
     )
     output_group.add_argument(
@@ -3166,10 +3299,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Ruta a un archivo SVG patron para fragmentar geometricamente todo el dibujo.",
     )
     parser.add_argument(
+        "--no-random-mystery-pattern",
+        action="store_true",
+        help="Desactiva la seleccion aleatoria de un patron SVG desde `patterns/`.",
+    )
+    parser.add_argument(
         "--dynamic-obfuscation",
         action="store_true",
         help=(
-            "Genera una mascara procedural a partir de los propios trazos del SVG para ocultar mejor la silueta."
+            "Genera una mascara Voronoi mixta guiada por contornos e interior del SVG para ocultar mejor la silueta."
+        ),
+    )
+    parser.add_argument(
+        "--no-dynamic-obfuscation",
+        action="store_true",
+        help=(
+            "Desactiva la mascara Voronoi mixta."
         ),
     )
     parser.add_argument(
@@ -3177,26 +3322,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.4,
         help=(
-            "Densidad relativa de la mascara dinamica derivada del SVG. Sube el valor para cruzar mas trazos."
+            "Densidad relativa de semillas Voronoi. Sube el valor para fragmentar mas el dibujo."
         ),
     )
     parser.add_argument(
         "--dynamic-obfuscation-spacing",
         type=float,
         default=24.0,
-        help="Separacion base entre fragmentos de la mascara dinamica en unidades SVG.",
+        help="Separacion base entre semillas de contorno de la mascara Voronoi en unidades SVG.",
     )
     parser.add_argument(
-        "--dynamic-obfuscation-offset",
+        "--dynamic-obfuscation-interior-ratio",
         type=float,
-        default=2.8,
-        help="Offset maximo usado para crear copias paralelas del trazo original en la mascara dinamica.",
+        default=DEFAULT_DYNAMIC_OBFUSCATION_INTERIOR_RATIO,
+        help="Peso relativo de semillas interiores frente a semillas de contorno (0..1).",
     )
     parser.add_argument(
-        "--dynamic-obfuscation-min-length",
+        "--dynamic-obfuscation-jitter",
         type=float,
-        default=8.0,
-        help="Longitud minima SVG que debe tener un subtramo para conservarse en la mascara dinamica.",
+        default=DEFAULT_DYNAMIC_OBFUSCATION_JITTER,
+        help="Jitter radial para dispersar de forma determinista las semillas interiores Voronoi.",
     )
     parser.add_argument(
         "--dynamic-obfuscation-grey",
@@ -3204,13 +3349,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="dynamic_obfuscation_gray",
         type=float,
         default=DEFAULT_DYNAMIC_OBFUSCATION_GRAY,
-        help="Tono gris de la mascara dinamica derivada del SVG (0..1).",
+        help="Tono gris de la mascara Voronoi mixta derivada del SVG (0..1).",
     )
     parser.add_argument(
         "--dynamic-obfuscation-width",
         type=float,
         default=DEFAULT_DYNAMIC_OBFUSCATION_WIDTH,
-        help="Grosor en puntos de la mascara dinamica derivada del SVG.",
+        help="Grosor en puntos de la mascara Voronoi mixta derivada del SVG.",
     )
     parser.add_argument(
         "--mystery-fit",
@@ -3322,7 +3467,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def resolve_single_output_path(input_svg: Path, explicit_output: Optional[str]) -> Path:
     if explicit_output:
         return Path(explicit_output).expanduser().resolve()
-    return input_svg.parent / "output" / f"{input_svg.stem}_paint_by_numbers.pdf"
+    stamped_stem = timestamped_output_stem(f"{input_svg.stem}_paint_by_numbers")
+    return input_svg.parent / "output" / f"{stamped_stem}.pdf"
 
 
 def collect_svg_inputs(input_dir: Path) -> List[Path]:
@@ -3340,6 +3486,38 @@ def resolve_batch_worker_count(requested_workers: Optional[int], svg_count: int)
     if svg_count <= 1:
         return 1
     return min(svg_count, max(os.cpu_count() or 1, 1))
+
+
+def get_default_patterns_dir() -> Path:
+    return Path(__file__).resolve().parent / "patterns"
+
+
+def resolve_mystery_pattern_for_run(svg_path: Path, args: argparse.Namespace) -> Optional[Path]:
+    configured_pattern = getattr(args, "mystery_pattern", None)
+    if configured_pattern:
+        pattern_path = Path(str(configured_pattern)).expanduser().resolve()
+        args.mystery_pattern = str(pattern_path)
+        return pattern_path
+
+    if getattr(args, "no_random_mystery_pattern", False):
+        return None
+
+    patterns_dir = get_default_patterns_dir()
+    pattern_candidates = sorted(patterns_dir.glob("*.svg"), key=lambda path: path.name.lower())
+    if not pattern_candidates:
+        raise SvgToPdfError(
+            "No se encontraron patrones SVG en `patterns/` para la ofuscacion por defecto. "
+            "Anade al menos un `.svg` o usa `--no-random-mystery-pattern`. "
+            f"{cli_help_hint()}"
+        )
+
+    selected_pattern = random.choice(pattern_candidates)
+    args.mystery_pattern = str(selected_pattern)
+    log_step(
+        f"Patron mystery aleatorio seleccionado para {svg_path.name}: {selected_pattern.name}",
+        args,
+    )
+    return selected_pattern
 
 
 def build_batch_worker_args(args: argparse.Namespace) -> Dict[str, object]:
@@ -3503,7 +3681,7 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
         future_positions = {}
         with ProcessPoolExecutor(max_workers=batch_workers) as executor:
             for file_index, svg_file in enumerate(svg_files, start=1):
-                output_pdf = batch_output_dir / f"{svg_file.stem}.pdf"
+                output_pdf = batch_output_dir / f"{timestamped_output_stem(svg_file.stem)}.pdf"
                 future = executor.submit(run_batch_job, str(svg_file), str(output_pdf), worker_args)
                 futures[future] = svg_file.name
                 future_positions[future] = file_index
@@ -3557,7 +3735,7 @@ def run_batch_directory(input_dir: Path, args: argparse.Namespace) -> int:
             print(f"Error inesperado registrando fuente: {exc}. {cli_help_hint()}", file=sys.stderr)
             return 3
         for file_index, svg_file in enumerate(svg_files, start=1):
-            output_pdf = batch_output_dir / f"{svg_file.stem}.pdf"
+            output_pdf = batch_output_dir / f"{timestamped_output_stem(svg_file.stem)}.pdf"
             file_started_at = time.perf_counter()
             completed_before_current = ok_count + fail_count
             log_batch_progress(
@@ -3687,14 +3865,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.dynamic_obfuscation_spacing,
             "Dynamic obfuscation spacing",
         )
-        dynamic_obfuscation_offset = validate_positive_value(
-            args.dynamic_obfuscation_offset,
-            "Dynamic obfuscation offset",
-            allow_zero=True,
+        dynamic_obfuscation_interior_ratio = validate_gray_value(
+            args.dynamic_obfuscation_interior_ratio,
+            "Dynamic obfuscation interior ratio",
         )
-        dynamic_obfuscation_min_length = validate_positive_value(
-            args.dynamic_obfuscation_min_length,
-            "Dynamic obfuscation min length",
+        dynamic_obfuscation_jitter = validate_positive_value(
+            args.dynamic_obfuscation_jitter,
+            "Dynamic obfuscation jitter",
+            allow_zero=True,
         )
         dynamic_obfuscation_width = validate_positive_value(
             args.dynamic_obfuscation_width,
@@ -3709,9 +3887,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args.dynamic_obfuscation_gray = dynamic_obfuscation_gray
     args.dynamic_obfuscation_density = dynamic_obfuscation_density
     args.dynamic_obfuscation_spacing = dynamic_obfuscation_spacing
-    args.dynamic_obfuscation_offset = dynamic_obfuscation_offset
-    args.dynamic_obfuscation_min_length = dynamic_obfuscation_min_length
+    args.dynamic_obfuscation_interior_ratio = dynamic_obfuscation_interior_ratio
+    args.dynamic_obfuscation_jitter = dynamic_obfuscation_jitter
     args.dynamic_obfuscation_width = dynamic_obfuscation_width
+    if args.no_dynamic_obfuscation:
+        args.dynamic_obfuscation = False
 
     if input_path.is_file():
         return run_single_file(input_path, args)

@@ -12,3 +12,8 @@ pdf-output-*/
 
 # Secrets
 .env
+
+# Keep folders but ignore contents
+outputs/*
+patterns/*
+inputs/*

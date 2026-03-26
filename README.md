@@ -36,6 +36,7 @@ La fuente usada para los numeros es `Montserrat` y se carga desde:
 ```bash
 python svg_to_paint_by_numbers_pdf.py <archivo.svg>
 python svg_to_paint_by_numbers_pdf.py <archivo.svg> -o <salida.pdf>
+python svg_to_paint_by_numbers_pdf.py <archivo.svg> --no-random-mystery-pattern
 python svg_to_paint_by_numbers_pdf.py <archivo.svg> --dynamic-obfuscation
 python svg_to_paint_by_numbers_pdf.py <archivo.svg> --mystery-pattern patterns/pattern.svg
 python svg_to_paint_by_numbers_pdf.py <carpeta_con_svgs>
@@ -45,6 +46,7 @@ Ejemplo con este repositorio:
 
 ```bash
 python svg_to_paint_by_numbers_pdf.py numbers.svg
+python svg_to_paint_by_numbers_pdf.py numbers.svg --no-random-mystery-pattern
 python svg_to_paint_by_numbers_pdf.py numbers.svg --dynamic-obfuscation
 python svg_to_paint_by_numbers_pdf.py numbers.svg --mystery-pattern patterns/pattern.svg
 python svg_to_paint_by_numbers_pdf.py inputs
@@ -71,14 +73,15 @@ En modo carpeta, tambien muestra progreso batch por archivo (`completados/total`
 - `--font-path`: ruta al TTF de Montserrat (por defecto `fonts/Montserrat-Regular.ttf`).
 - `-o/--output`: salida PDF explicita (solo modo archivo individual).
 - `--representation-grey OUTLINE NUMBER`: override de grises para contorno y numeros (0..1). Ejemplo: `--representation-grey 0.68 0.72`.
-- `--mystery-pattern`: aplica un SVG patron para fragmentar geometricamente todas las zonas del dibujo.
-- `--dynamic-obfuscation`: deriva una mascara procedural desde los propios trazos del SVG.
-- `--dynamic-obfuscation-density`: controla cuanta mascara se genera a partir de los trazos base.
-- `--dynamic-obfuscation-spacing`: separacion base entre subtramos de la mascara.
-- `--dynamic-obfuscation-offset`: cuanto se separan las copias paralelas respecto al trazo original.
-- `--dynamic-obfuscation-min-length`: longitud minima de subtramo para conservarse.
-- `--dynamic-obfuscation-grey`: tono gris de la mascara derivada.
-- `--dynamic-obfuscation-width`: grosor de la mascara derivada.
+- `--mystery-pattern`: aplica un SVG patron concreto para fragmentar geometricamente todas las zonas del dibujo.
+- `--no-random-mystery-pattern`: desactiva la ofuscacion por patron aleatorio desde `patterns/`.
+- `--dynamic-obfuscation`: anade la mascara Voronoi mixta guiada por el SVG como capa extra opcional.
+- `--dynamic-obfuscation-density`: controla cuantas semillas Voronoi se generan.
+- `--dynamic-obfuscation-spacing`: separacion base entre semillas de contorno.
+- `--dynamic-obfuscation-interior-ratio`: peso relativo de semillas interiores frente a contorno.
+- `--dynamic-obfuscation-jitter`: dispersion determinista de semillas interiores.
+- `--dynamic-obfuscation-grey`: tono gris de la mascara Voronoi.
+- `--dynamic-obfuscation-width`: grosor de la mascara Voronoi.
 - `--mystery-fit`: ajusta el patron al `viewBox` del dibujo (`contain`, `cover`, `stretch`).
 - `--mystery-min-fragment-area`: area minima para conservar un fragmento generado por el patron.
 - `--mystery-min-fragment-ratio`: proporcion minima respecto al area original para conservar un fragmento.
@@ -112,8 +115,8 @@ En modo carpeta, tambien muestra progreso batch por archivo (`completados/total`
 
 - No reutiliza rellenos de color originales en el arte final.
 - Traza toda la geometria con un gris tenue (default contorno `0.68`) sobre fondo blanco.
-- En modo mystery, puede fragmentar todas las zonas del dibujo usando un patron SVG superpuesto geometricamente.
-- En modo `--dynamic-obfuscation`, genera subtramos parciales y offsets paralelos a partir del propio SVG para camuflar la silueta sin redibujarla completa.
+- Por defecto, selecciona aleatoriamente un patron SVG desde `patterns/` y fragmenta geometricamente las zonas del dibujo.
+- En modo `--dynamic-obfuscation`, anade una malla Voronoi mixta a partir de semillas en contornos e interior para fragmentar visualmente toda la silueta.
 - Dibuja tambien las divisiones internas del patron con un gris configurable para ofuscar la lectura de la silueta.
 - Mantiene posiciones/proporciones del SVG dentro de una pagina A4.
 
@@ -142,20 +145,23 @@ En modo carpeta, tambien muestra progreso batch por archivo (`completados/total`
 - Genera el documento final con `reportlab`.
 - Pagina unica A4 con margenes razonables, dibujo principal y leyenda inferior.
 
-### 7) Modo mystery / ofuscado
+### 7) Modo mystery / ofuscado por patron
 
-- Carga un `pattern.svg` independiente y lo ajusta al `viewBox` del dibujo.
+- Por defecto, elige aleatoriamente un patron `.svg` de `patterns/` para cada ejecucion.
+- Si pasas `--mystery-pattern`, usa exactamente ese patron en lugar de uno aleatorio.
+- Si pasas `--no-random-mystery-pattern`, no aplica este tipo de ofuscacion.
+- Carga el patron independiente y lo ajusta al `viewBox` del dibujo.
 - Usa las fronteras del patron para dividir geometricamente las zonas coloreables.
 - Cada fragmento conserva el color original de su zona, por lo que la leyenda no cambia de concepto.
 - Si un fragmento resultante es demasiado pequeno o excesivo en cantidad, el sistema conserva la zona original.
 
-### 8) Mascara dinamica derivada del SVG
+### 8) Mascara Voronoi mixta derivada del SVG
 
-- Reutiliza los propios `paths` del arte como semilla visual.
-- Corta cada trazo en subtramos parciales y les aplica offsets paralelos deterministas.
-- Recorta esos subtramos contra la union real de zonas para que la mascara solo viva dentro del dibujo.
-- El resultado ayuda a esconder la lectura global de la silueta, pero mantiene un lenguaje grafico coherente con el SVG original.
-- Se puede combinar con `--mystery-pattern` si quieres mezclar fragmentacion geometrica y trazos derivados.
+- Reutiliza los `paths` del arte para sembrar puntos de contorno de forma determinista.
+- Anade semillas interiores por zona usando `polylabel`, puntos representativos y jitter controlado.
+- Genera un Voronoi sobre esa nube mixta de semillas y recorta las celdas contra la union real del dibujo.
+- Dibuja solo aristas internas para evitar reforzar la silueta exterior mientras fragmenta visualmente toda la figura.
+- Se puede combinar con el patron mystery si quieres mezclar fragmentacion geometrica por patron y trama Voronoi.
 
 ## Manejo basico de errores
 
